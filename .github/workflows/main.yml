@@ -541,23 +541,6 @@ jobs:
           const DB = (process.env.FIREBASE_DB_URL || "").replace(/\/+$/, "");
           const ACCOUNT = process.env.ACCOUNT_LABEL || "ZEDGE";
 
-          // v26.2 exact-time publish: the gate releases a few minutes early; we hold right before the Publish click
-          // until HH:MM (Asia/Dhaka) sharp. Only the first publish of the run is held.
-          const EXACT_TARGET = (process.env.EXACT_TARGET_DHAKA || "").trim();
-          let exactHoldUsed = false;
-          async function waitForExactTarget(stage) {
-            if (exactHoldUsed || !/^\d{2}:\d{2}$/.test(EXACT_TARGET)) return;
-            exactHoldUsed = true;
-            const parts = EXACT_TARGET.split(":").map(Number);
-            const goal = parts[0] * 60 + parts[1];
-            const dhakaNow = () => { const d = new Date(Date.now() + 6 * 3600 * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes() + d.getUTCSeconds() / 60; };
-            let diff = goal - dhakaNow();
-            if (diff <= 0) { console.log("EXACT_TIME => target " + EXACT_TARGET + " Dhaka passed " + Math.abs(diff).toFixed(1) + " min ago - " + stage + " now."); return; }
-            if (diff > 40) { console.log("EXACT_TIME => target " + EXACT_TARGET + " is " + diff.toFixed(0) + " min away (too far, ignoring hold)."); return; }
-            console.log("EXACT_TIME => holding " + diff.toFixed(1) + " min so " + stage + " lands at " + EXACT_TARGET + " Dhaka sharp.");
-            while ((diff = goal - dhakaNow()) > 0) await new Promise(r => setTimeout(r, Math.min(15000, Math.max(250, diff * 60000))));
-            console.log("EXACT_TIME => " + EXACT_TARGET + " reached - " + stage + " now.");
-          }
           const PROFILE_OVERRIDE = (process.env.VPN_PROFILE || "").trim();
           const VPN_PATH = "dashboardSettings/vpn";
           const IS_WIN = process.platform === "win32";
@@ -1016,6 +999,23 @@ jobs:
             console.log(vpnActive ? "🌐 No HTTP proxy — traffic goes through the VPN tunnel." : "🌐 No proxy configured — running with direct connection.");
           }
 
+          // v26.2/v27.5 exact-time publish (bot.js scope): the gate releases a few minutes early; we hold right before the Publish click
+          // until HH:MM (Asia/Dhaka) sharp. Only the first publish of the run is held.
+          const EXACT_TARGET = (process.env.EXACT_TARGET_DHAKA || "").trim();
+          let exactHoldUsed = false;
+          async function waitForExactTarget(stage) {
+            if (exactHoldUsed || !/^\d{2}:\d{2}$/.test(EXACT_TARGET)) return;
+            exactHoldUsed = true;
+            const parts = EXACT_TARGET.split(":").map(Number);
+            const goal = parts[0] * 60 + parts[1];
+            const dhakaNow = () => { const d = new Date(Date.now() + 6 * 3600 * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes() + d.getUTCSeconds() / 60; };
+            let diff = goal - dhakaNow();
+            if (diff <= 0) { console.log("EXACT_TIME => target " + EXACT_TARGET + " Dhaka passed " + Math.abs(diff).toFixed(1) + " min ago - " + stage + " now."); return; }
+            if (diff > 40) { console.log("EXACT_TIME => target " + EXACT_TARGET + " is " + diff.toFixed(0) + " min away (too far, ignoring hold)."); return; }
+            console.log("EXACT_TIME => holding " + diff.toFixed(1) + " min so " + stage + " lands at " + EXACT_TARGET + " Dhaka sharp.");
+            while ((diff = goal - dhakaNow()) > 0) await new Promise(r => setTimeout(r, Math.min(15000, Math.max(250, diff * 60000))));
+            console.log("EXACT_TIME => " + EXACT_TARGET + " reached - " + stage + " now.");
+          }
           async function firebaseGet(pathName) {
             const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`);
             if (!res.ok) throw new Error(`Firebase GET failed: ${res.status}`);
@@ -2385,10 +2385,50 @@ jobs:
               .filter({ hasText: /^Publish$/ })
               .first();
 
-            await publishButton.waitFor({ state: "visible", timeout: 15000 });
-            await scrollToElement(publishButton);
-            await page.waitForTimeout(300);
-            await publishButton.click();
+            // v27.5 robust publish: scroll + 3 click strategies + confirm the button is gone
+            let publishClicked = false;
+            try {
+              await publishButton.waitFor({ state: "visible", timeout: 15000 });
+              await publishButton.scrollIntoViewIfNeeded().catch(() => {});
+              await scrollToElement(publishButton).catch(() => {});
+              await page.waitForTimeout(300);
+              await publishButton.click({ timeout: 8000 });
+              publishClicked = true;
+            } catch (e) {
+              console.log("Publish click (primary) failed: " + (e && e.message ? e.message.split("\n")[0] : e));
+            }
+            if (!publishClicked) {
+              await page.mouse.wheel(0, 4000).catch(() => {});
+              await page.waitForTimeout(600);
+              const byRole = page.getByRole("button", { name: /^Publish$/ }).first();
+              try {
+                await byRole.waitFor({ state: "visible", timeout: 8000 });
+                await byRole.scrollIntoViewIfNeeded().catch(() => {});
+                await byRole.click({ timeout: 8000 });
+                publishClicked = true;
+                console.log("Publish clicked via role locator");
+              } catch (e2) {
+                console.log("Publish click (role) failed: " + (e2 && e2.message ? e2.message.split("\n")[0] : e2));
+              }
+            }
+            if (!publishClicked) {
+              publishClicked = await page.evaluate(() => {
+                const btn = Array.from(document.querySelectorAll("button")).find((b) => (b.textContent || "").trim() === "Publish");
+                if (!btn) return false;
+                btn.scrollIntoView({ block: "center" });
+                btn.click();
+                return true;
+              }).catch(() => false);
+              console.log(publishClicked ? "Publish clicked via DOM" : "Publish button not found in DOM");
+            }
+            if (!publishClicked) throw new Error("Publish button could not be clicked - item left as draft");
+            try {
+              await publishButton.waitFor({ state: "hidden", timeout: 15000 });
+            } catch (_) {
+              console.log("Publish button still visible after click - retrying once (force)");
+              await publishButton.click({ force: true, timeout: 5000 }).catch(() => {});
+              await page.waitForTimeout(1500);
+            }
 
             console.log("Clicked Publish");
           }
