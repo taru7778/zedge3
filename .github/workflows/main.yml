@@ -77,6 +77,7 @@ jobs:
     outputs:
       go: ${{ steps.decide.outputs.go }}
       exact: ${{ steps.decide.outputs.exact }}
+      target: ${{ steps.decide.outputs.target }}
     steps:
       - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up)
         id: decide
@@ -134,11 +135,13 @@ jobs:
             else if (!okEnd) { const e = clampEnd(hour * 60 + minute); endHour = Math.floor(e / 60); endMinute = e % 60; }
             return { hour, minute, exact, endHour, endMinute };
           };
+          let EXACT_LEAD_MIN = 6;                      // v26.2: minutes the gate releases early for exact slots (dashboardSettings/schedule.exactLeadMin, 0-25)
           let slots = toSlots(DEFAULT_WINDOWS), source = "yml-default";
           try {
             const s = await jget("dashboardSettings/schedule");
             const w = s && Array.isArray(s.windows) ? s.windows.map(Number).filter(x => Number.isInteger(x) && x >= 0 && x <= 23) : null;
             const sl = s && Array.isArray(s.slots) ? s.slots.map(normSlot).filter(Boolean) : null;
+            const lm = s ? Number(s.exactLeadMin) : NaN; if (Number.isFinite(lm)) EXACT_LEAD_MIN = Math.max(0, Math.min(25, Math.round(lm)));
             if (sl && sl.length) { slots = sl; source = "firebase-slots"; }
             else if (w && w.length) { slots = toSlots(w); source = "firebase"; }
           } catch (e) { console.log("Schedule read failed (" + e.message + ") - using yml defaults."); }
@@ -154,26 +157,36 @@ jobs:
 
           const now = h * 60 + m;
           // active from the slot start until its end (+ one ping of slack so a missed final ping can still catch up)
-          const wIdx = slots.findIndex((s, i) => now >= startOf(s) && now < Math.max(endOf(s), targetOf(s, i)) + SLOT_MIN);
-          let decision = "outside", go = false, curSlot = -1, chosen = -1, waitMin = 0, exact = false, target = "", targetMin = -1;
+          // v26.2 exact-time fix:
+          //  (1) an exact slot is "active" one ping BEFORE its minute, so the early ping sleeps instead of falling
+          //      through to "outside" (that bug made every exact upload run on the NEXT ping = 10-30 min late);
+          //  (2) exact slots release EXACT_LEAD_MIN minutes early so checkout/Playwright/login/generation finish first,
+          //      and bot.js holds the Publish click until HH:MM Dhaka sharp (EXACT_TARGET_DHAKA env).
+          const leadOf = (s) => s.exact ? EXACT_LEAD_MIN : 0;
+          const fireOf = (s, i) => targetOf(s, i) - leadOf(s);
+          const isActive = (s, i) => now >= Math.min(startOf(s), fireOf(s, i) - SLOT_MIN) && now < Math.max(endOf(s), targetOf(s, i)) + SLOT_MIN;
+          let wIdx = slots.findIndex((s, i) => isActive(s, i) && !(runsToday && runsToday[i]));   // prefer an active slot that has not run yet
+          if (wIdx < 0) wIdx = slots.findIndex(isActive);
+          let decision = "outside", go = false, curSlot = -1, chosen = -1, waitMin = 0, exact = false, target = "", targetMin = -1, fireMin = -1;
           if (wIdx >= 0) {
             const slot = slots[wIdx];
             exact = slot.exact === true;
             targetMin = targetOf(slot, wIdx);
+            fireMin = fireOf(slot, wIdx);
             target = pad2(Math.floor(targetMin / 60)) + ":" + pad2(targetMin % 60);
             curSlot = Math.floor((now - startOf(slot)) / SLOT_MIN);
             chosen = Math.floor((targetMin - startOf(slot)) / SLOT_MIN);
             if (runsToday && runsToday[wIdx]) decision = "done";                        // this slot already ran today
-            else if (now >= targetMin) {
-              if (now - targetMin < SLOT_MIN) { decision = "run"; go = true; }
+            else if (now >= fireMin) {
+              if (now - fireMin < SLOT_MIN) { decision = "run"; go = true; }
               else if (runsKnown) { decision = "catch-up"; go = true; }               // the ping that should have fired was missed
               else decision = "wait";
             }
-            else if (targetMin - now < SLOT_MIN) { decision = "run"; go = true; waitMin = targetMin - now; }   // early ping -> sleep until the target minute
+            else if (fireMin - now < SLOT_MIN) { decision = "run"; go = true; waitMin = fireMin - now; }   // early ping -> sleep until the release minute
             else decision = "wait";
           }
           const slotDesc = slots.map((s, i) => `S${i + 1} ${pad2(s.hour)}:${pad2(s.minute)}${s.exact ? " exact" : "-" + pad2(s.endHour) + ":" + pad2(s.endMinute) + " random"}`).join(", ");
-          console.log(`Date ${dateKey} ${hhmm} (Dhaka) | slots [${slotDesc}] (${source}) | slot ${wIdx}${wIdx >= 0 ? ` | target ${target} (${exact ? "exact" : "random in range"})` : ""} | decision: ${decision}${waitMin ? ` (sleeping ${waitMin} min until ${target})` : ""}`);
+          console.log(`Date ${dateKey} ${hhmm} (Dhaka) | slots [${slotDesc}] (${source}) | slot ${wIdx}${wIdx >= 0 ? ` | target ${target} (${exact ? "exact" : "random in range"})` : ""} | decision: ${decision}${waitMin ? ` (sleeping ${waitMin} min until ${pad2(Math.floor(fireMin / 60)) + ":" + pad2(fireMin % 60)}${exact ? ", publish at " + target : ""})` : ""}`);
 
           try {
             await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, slotsUsed: slots, windowsSource: source, lastRunId: RUN_ID, lastMode: wIdx >= 0 ? (exact ? "exact" : "random") : null });
@@ -183,14 +196,15 @@ jobs:
             try {
               const all = (await jget("dashboardSettings/gate/runs")) || {};
               const today = Object.assign({}, all[dateKey] || {});
-              today[wIdx] = { at: Date.now() + waitMin * 60000, dhaka: waitMin ? target : hhmm, slot: curSlot, chosen, exact, target, catchUp: decision === "catch-up", runId: RUN_ID };
+              today[wIdx] = { at: Date.now() + waitMin * 60000, dhaka: exact ? target : (waitMin ? target : hhmm), slot: curSlot, chosen, exact, target, lead: exact ? EXACT_LEAD_MIN : 0, catchUp: decision === "catch-up", runId: RUN_ID };
               await jwrite("dashboardSettings/gate/runs", "PUT", { [dateKey]: today });   // keeps only today
               await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now() + waitMin * 60000, lastRunDhaka: `${dateKey} ${waitMin ? target : hhmm}`, lastRunWindow: wIdx });
             } catch (e) { console.log("Run marker failed: " + e.message); }
             if (waitMin > 0) {
-              console.log(`Waiting ${waitMin} min so the upload starts at ${target} Dhaka...`);
+              console.log(exact ? `Waiting ${waitMin} min - releasing ${EXACT_LEAD_MIN} min early so the Publish click lands at ${target} Dhaka sharp...` : `Waiting ${waitMin} min so the upload starts at ${target} Dhaka...`);
               await new Promise(r => setTimeout(r, waitMin * 60 * 1000));
             }
+            if (exact) setOutput("target", target);   // v26.2: bot.js holds Publish until this HH:MM (Dhaka)
             setOutput("exact", "yes");   // v23.1: gate already picked the minute -> skip the extra random delay in both modes
           }
           process.exit(go ? 0 : 2);
@@ -526,6 +540,24 @@ jobs:
           const MODE = (process.argv[2] || "connect").toLowerCase();
           const DB = (process.env.FIREBASE_DB_URL || "").replace(/\/+$/, "");
           const ACCOUNT = process.env.ACCOUNT_LABEL || "ZEDGE";
+
+          // v26.2 exact-time publish: the gate releases a few minutes early; we hold right before the Publish click
+          // until HH:MM (Asia/Dhaka) sharp. Only the first publish of the run is held.
+          const EXACT_TARGET = (process.env.EXACT_TARGET_DHAKA || "").trim();
+          let exactHoldUsed = false;
+          async function waitForExactTarget(stage) {
+            if (exactHoldUsed || !/^\d{2}:\d{2}$/.test(EXACT_TARGET)) return;
+            exactHoldUsed = true;
+            const parts = EXACT_TARGET.split(":").map(Number);
+            const goal = parts[0] * 60 + parts[1];
+            const dhakaNow = () => { const d = new Date(Date.now() + 6 * 3600 * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes() + d.getUTCSeconds() / 60; };
+            let diff = goal - dhakaNow();
+            if (diff <= 0) { console.log("EXACT_TIME => target " + EXACT_TARGET + " Dhaka passed " + Math.abs(diff).toFixed(1) + " min ago - " + stage + " now."); return; }
+            if (diff > 40) { console.log("EXACT_TIME => target " + EXACT_TARGET + " is " + diff.toFixed(0) + " min away (too far, ignoring hold)."); return; }
+            console.log("EXACT_TIME => holding " + diff.toFixed(1) + " min so " + stage + " lands at " + EXACT_TARGET + " Dhaka sharp.");
+            while ((diff = goal - dhakaNow()) > 0) await new Promise(r => setTimeout(r, Math.min(15000, Math.max(250, diff * 60000))));
+            console.log("EXACT_TIME => " + EXACT_TARGET + " reached - " + stage + " now.");
+          }
           const PROFILE_OVERRIDE = (process.env.VPN_PROFILE || "").trim();
           const VPN_PATH = "dashboardSettings/vpn";
           const IS_WIN = process.platform === "win32";
@@ -1369,7 +1401,7 @@ jobs:
             return slots.every(s => slotFileUrl(item, s));
           }
 
-          async function getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked = false) {
+          async function getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked = false, variety = null) {
             console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType}${dayTypeLocked ? " - LOCKED for today" : ""})`);
             console.log(`ACTIVE_DB: ${firebaseDatabaseURL}`);
             const data = await firebaseGet(queuePath);
@@ -1453,7 +1485,30 @@ jobs:
             let effectiveDayType = dayType;
             let dayTypeSwitchedTo = null;
             let entries = pinnedEntries.length ? pinnedEntries : entriesOfType(wantedType);
-            if (!pinnedEntries.length) {
+            // v25 MIX MODE (dashboardSettings/variety.enabled): every slot of the day uploads a DIFFERENT
+            // content type. Slot k takes order[k] (order rotates daily so the first slot is not always the
+            // same type). Types already uploaded today are skipped; a type with no stock is skipped for
+            // the next unused type. strict=true -> never repeat a type on the same day (wait instead).
+            let varietyPick = null;
+            if (variety && variety.enabled && !pinnedEntries.length) {
+              const used = Array.isArray(variety.usedToday) ? variety.usedToday : [];
+              const unused = variety.order.filter(t => !used.includes(t));
+              const seq = unused.length ? unused : (variety.strict ? [] : variety.order.slice());
+              let chosen = null;
+              const empty = [];
+              for (const t of seq) { const found = entriesOfType(t); if (found.length) { chosen = { t, found }; break; } empty.push(t); }
+              if (!chosen) {
+                const metaNote = missingMeta.length ? ` NO_METADATA => ${missingMeta.length} file(s) are waiting for metadata and were not counted.` : "";
+                throw new Error(`MIX_MODE_WAIT => mix mode is ON and no queued file exists for any ${variety.strict ? "unused " : ""}type today (used today: [${used.join(", ") || "none"}], empty: [${empty.join(", ")}]). Add files of another type or pin an item.${metaNote}`);
+              }
+              pickedType = chosen.t;
+              entries = chosen.found;
+              varietyPick = chosen.t;
+              console.log(`MIX_MODE => slot ${used.length + 1}: uploading ${chosen.t} (${chosen.found.length} queued). Used today: [${used.join(", ") || "none"}] | order today: ${variety.order.join(" > ")}${empty.length ? ` | skipped (empty): ${empty.join(", ")}` : ""}`);
+            }
+            if (varietyPick) {
+              // handled above - day-type rotation / lock rules do not apply in mix mode
+            } else if (!pinnedEntries.length) {
               if (dayTypeLocked) {
                 if (!entries.length) {
                   throw new Error(`DAY_LOCKED => today is a ${dayType} day (locked) and no more ${wantedType} queued. Not switching type mid-day - nothing more to upload today.`);
@@ -1598,6 +1653,7 @@ jobs:
               contentType,
               isMp3,
               dayTypeSwitchedTo,
+              varietyType: varietyPick,
               isPinnedPick,
               name:        item.name || id,
               title:       item.title || "",
@@ -2320,6 +2376,7 @@ jobs:
 
             console.log("Video ad radio selected");
 
+            await waitForExactTarget("Publish");   // v26.2 exact-time hold
             // ── PUBLISH BUTTON ────────────────────────────────────
             console.log("Looking for Publish button");
 
@@ -2563,6 +2620,29 @@ jobs:
               let dayType = profileStateData.state.uploadDayType || "AUDIO";
               const DAY_TYPE_LOGS = { AUDIO: "🎵 AUDIO (Ringtone)", WALLPAPER: "🖼️ WALLPAPER (Image)", WALLPAPER_24H: "🌅 DYNAMIC 24H WALLPAPER", WALLPAPER_DUAL: "🔒 DUAL WALLPAPER", WALLPAPER_BATTERY: "🔋 BATTERY WALLPAPER", LIVE_WALLPAPER: "🎬 LIVE WALLPAPER", CHARGING_ANIMATION: "⚡ CHARGING ANIMATION" };
               console.log(`📅 Today's upload type: ${DAY_TYPE_LOGS[dayType] || dayType} day`);
+
+              // ── v25 MIX MODE settings (panel / app -> dashboardSettings/variety) ─────────────
+              //   { enabled: bool, types: ["RINGTONE", "WALLPAPER", ...], strict: bool }
+              //   enabled=false / missing -> classic one-content-type-per-day rotation above.
+              let variety = null;
+              try {
+                const vRaw = await firebaseGet("dashboardSettings/variety");
+                if (vRaw && vRaw.enabled === true) {
+                  const KNOWN_CT = ["RINGTONE", "WALLPAPER", "WALLPAPER_24H", "WALLPAPER_DUAL", "WALLPAPER_BATTERY", "LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+                  let vTypes = Array.isArray(vRaw.types) ? vRaw.types.map(t => String(t || "").toUpperCase().replace(/^AUDIO$/, "RINGTONE")).filter(t => KNOWN_CT.includes(t)) : [];
+                  vTypes = Array.from(new Set(vTypes));
+                  if (vTypes.length < 2) vTypes = KNOWN_CT.slice();
+                  const dhakaDayNo = Math.floor((Date.now() + 6 * 3600 * 1000) / 86400000);
+                  const startAt = dhakaDayNo % vTypes.length;
+                  const order = vTypes.map((_, i) => vTypes[(startAt + i) % vTypes.length]);
+                  const vu = currentState.varietyUsed;
+                  const usedToday = (vu && vu.date === currentState.lastUploadDate && Array.isArray(vu.types)) ? vu.types.slice() : [];
+                  variety = { enabled: true, strict: vRaw.strict === true, types: vTypes, order, usedToday };
+                  console.log(`🎨 MIX MODE ON => 3 slots = 3 different content types. Order today: ${order.join(" > ")} | used today: [${usedToday.join(", ") || "none"}] | strict: ${variety.strict}`);
+                }
+              } catch (vErr) {
+                console.log(`variety settings read failed (${vErr.message}) - using normal day-type mode.`);
+              }
 
               // 2. Filter UA pool by selected group then pick random fingerprint
               const UA_GROUP_SEL = (process.env.UA_GROUP || "random").toLowerCase();
@@ -3025,6 +3105,10 @@ jobs:
                 PUBLISHED: "✅ PUBLISHED", "IN REVIEW": "🔍 IN REVIEW", PENDING: "⏳ PENDING", REJECTED: "⛔ REJECTED", UNKNOWN: "❓ UNKNOWN"
               };
               const ctypeLabel = (qi) => CTYPE_BN[qi?.contentType] || (qi?.isMp3 ? CTYPE_BN.RINGTONE : CTYPE_BN.WALLPAPER);
+              // v25: Telegram day label - mix mode shows the mode + this slot's content type instead of the day type
+              const dayLabelBn = (qi) => (variety && variety.enabled)
+                ? `🎨 মিক্স মোড${qi && qi.varietyType ? " · " + (CTYPE_BN[qi.varietyType] || qi.varietyType) : ""}`
+                : (DAY_TYPE_BN[dayType] || dayType);
               // Card-style message builder: header line + key/value rows + footer
               const tgCard = (header, rows, footer) => {
                 const body = rows.filter(r => r && r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `${k} ${v}`).join("\n");
@@ -3042,7 +3126,7 @@ jobs:
                 try {
                   // Fetch the next queued item
                   const dayTypeLocked = Boolean(currentState.dayTypeLockedDate) && currentState.dayTypeLockedDate === currentState.lastUploadDate;
-                  queueItem = await getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked);
+                  queueItem = await getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked, variety);
                   if (queueItem.dayTypeSwitchedTo && queueItem.dayTypeSwitchedTo !== dayType) {
                     // Keep local state in sync so updateProfileStateAfterUpload() does not
                     // write the OLD day type back to Firebase, and so tomorrow rotates from the new one.
@@ -3074,7 +3158,7 @@ jobs:
                       `ℹ️ <b>আজ কোনো আপলোড হয়নি</b>`,
                       [
                         ["📁 প্রজেক্ট:", tgEscape(runLabel)],
-                        ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
+                        ["📅 আজকের ডে:", dayLabelBn(typeof queueItem !== "undefined" ? queueItem : null)],
                         ["📝 কারণ:", why],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
@@ -3205,7 +3289,12 @@ jobs:
 
                   // LOCK today's day type after the first rotation (non-pinned) upload,
                   // so the type can never switch mid-day.
-                  if (!queueItem.isPinnedPick && currentState.dayTypeLockedDate !== currentState.lastUploadDate) {
+                  // v25 MIX MODE: remember which types were uploaded today (so the other slots pick different ones)
+                  if (queueItem.varietyType && variety) {
+                    variety.usedToday.push(queueItem.varietyType);
+                    await firebasePatch("uploadState", { varietyUsed: { date: currentState.lastUploadDate, types: variety.usedToday, updatedAt: Date.now() } });
+                    console.log(`🎨 Mix mode: ${queueItem.varietyType} done - used today: [${variety.usedToday.join(", ")}]`);
+                  } else if (!queueItem.isPinnedPick && currentState.dayTypeLockedDate !== currentState.lastUploadDate) {
                     await firebasePatch("uploadState", { dayTypeLockedDate: currentState.lastUploadDate });
                     currentState = { ...currentState, dayTypeLockedDate: currentState.lastUploadDate };
                     console.log(`🔒 Day type ${dayType} locked for today.`);
@@ -3239,7 +3328,7 @@ jobs:
                         ["🗂 কনটেন্ট:", fileTypeLabel],
                         ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
                         ["📌 Zedge স্ট্যাটাস:", statusLine],
-                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
+                        ["📅 আজকের ডে:", `${dayLabelBn(queueItem)} · আপলোড ${todayProgress}`],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
                       "💡 ফাইলটি কিউ থেকে সরানো হয়েছে এবং আজকের আপলোড লিমিটে গণনা করা হয়েছে। Zedge এটি রিভিউয়ে রেখেছে/রিজেক্ট করেছে — কনটেন্ট গাইডলাইন চেক করে দেখুন।"
@@ -3254,7 +3343,7 @@ jobs:
                         ["🗂 কনটেন্ট:", fileTypeLabel],
                         ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
                         ["📌 Zedge স্ট্যাটাস:", statusLine],
-                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
+                        ["📅 আজকের ডে:", `${dayLabelBn(queueItem)} · আপলোড ${todayProgress}`],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
                       publishResult.statusName === "PUBLISHED"
@@ -3354,7 +3443,7 @@ jobs:
                   [
                     ["👋", `${getDhakaGreeting()}।`],
                     ["📁 প্রজেক্ট:", tgEscape(runLabel)],
-                    ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
+                    ["📅 আজকের ডে:", dayLabelBn(typeof queueItem !== "undefined" ? queueItem : null)],
                     ["📊 ফলাফল:", `${published} লাইভ/রিভিউ · ${removedCount} সরানো · ${failedCount} ব্যর্থ (মোট ${attempted})`],
                     ["📈 আজ মোট:", `${currentState.totalUploadsToday}/${DAILY_LIMIT_UI} আপলোড`],
                     ["⏱ সময় লেগেছে:", fmtDuration(Date.now() - runStartedAt)],
@@ -3435,6 +3524,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
           FOLDER_NAME: "Zedge 3"
+          EXACT_TARGET_DHAKA: ${{ needs.gate.outputs.target }}   # v26.2: gate released early, hold Publish until this minute
 
         run: node bot.js
 
