@@ -1,21 +1,8 @@
 name: Zedge Safe Automation + Realtime DB Wallpaper & Ringtone
-run-name: ${{ inputs.run_mode == 'vpn_test' && format('🔐 VPN test ({0})', inputs.vpn_profile) || 'Zedge automation' }} · ${{ inputs.os }}
 
 on:
   workflow_dispatch:
     inputs:
-      run_mode:
-        description: "⚙️ Run mode - 'vpn_test' only checks the VPN profile and skips the automation"
-        required: false
-        default: "automation"
-        type: choice
-        options:
-          - automation
-          - vpn_test
-      vpn_profile:
-        description: "🔐 VPN profile id to test (blank = active profile from Firebase dashboardSettings/vpn)"
-        required: false
-        default: ""
       proxy_server:
         description: "HTTP proxy host:port (leave blank to run without proxy)"
         required: false
@@ -27,13 +14,11 @@ on:
         description: "Proxy password"
         required: false
       zedge_email:
-        description: "Zedge email (not needed for vpn_test)"
-        required: false
-        default: ""
+        description: "Zedge email"
+        required: true
       zedge_password:
-        description: "Zedge password (not needed for vpn_test)"
-        required: false
-        default: ""
+        description: "Zedge password"
+        required: true
       headless:
         description: "Run headless? true/false"
         required: true
@@ -71,13 +56,9 @@ on:
 
 jobs:
   gate:
-    # v24: skipped entirely for VPN connection tests
-    if: inputs.run_mode != 'vpn_test'
     runs-on: ubuntu-latest
     outputs:
       go: ${{ steps.decide.outputs.go }}
-      exact: ${{ steps.decide.outputs.exact }}
-      target: ${{ steps.decide.outputs.target }}
     steps:
       - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up)
         id: decide
@@ -89,123 +70,65 @@ jobs:
             exit 0
           fi
           cat > gate.mjs <<'GATE_EOF'
-          import fs from "fs";
-          // ---- v23 smart gate ------------------------------------------------
-          // Schedule lives in Firebase: dashboardSettings/schedule
-          //   windows: [h,h,h]                       (legacy - start hour of each 3 h window)
-          //   slots:   [{hour,minute,exact}, ...]    (v23 - exact upload time per slot, set from the app / panel)
-          // cron-job.org pings every 30 min all day; this gate decides.
-          //   exact=false -> old behaviour: one random 30-min slot inside the 3 h window (deterministic hash)
-          //   exact=true  -> upload starts at HH:MM sharp (the gate sleeps until that minute if the ping came early;
-          //                  a missed ping is caught up on the next ping within the same 3 h window).
-          // Falls back to DEFAULT_WINDOWS if Firebase is unreachable. Health + run markers -> dashboardSettings/gate.
-          const DB = "https://zedge3-1b3dc-default-rtdb.firebaseio.com";
+          // ---- v9 smart gate -------------------------------------------------
+          // Schedule lives in Firebase: dashboardSettings/schedule = { windows: [h,h,h] }
+          // (edit it from the dashboard / app). cron-job.org just pings every 30 min
+          // all day; this gate decides. Falls back to DEFAULT_WINDOWS if Firebase is
+          // unreachable. Health + run markers are written to dashboardSettings/gate.
+          const DB = "https://YOUR-ZEDGE3-PROJECT-default-rtdb.firebaseio.com";
           const ACCOUNT = "ZEDGE3";
           const DEFAULT_WINDOWS = [5, 11, 17];   // window start hours (Asia/Dhaka) - fallback only
           const WINDOW_HOURS = 3;                      // each window lasts 3 hours
           const SLOT_MIN = 30;                         // scheduler pings every 30 min
           const RUN_ID = process.env.GITHUB_RUN_ID || "";
-          const OUT = process.env.GITHUB_OUTPUT || "";
-          const setOutput = (k, v) => { try { if (OUT) fs.appendFileSync(OUT, `${k}=${v}\n`); } catch (_) {} };
 
           const dhaka = new Date(Date.now() + 6 * 3600 * 1000);   // UTC+6
           const h = dhaka.getUTCHours(), m = dhaka.getUTCMinutes();
           const dateKey = dhaka.toISOString().slice(0, 10);
-          const pad2 = (n) => String(n).padStart(2, "0");
-          const hhmm = pad2(h) + ":" + pad2(m);
+          const hhmm = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
           const jget = async (path) => { const r = await fetch(`${DB}/${path}.json`); if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`); return r.json(); };
           const jwrite = async (path, method, body) => { const r = await fetch(`${DB}/${path}.json`, { method, body: JSON.stringify(body) }); if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`); };
 
-          // ---- read schedule (slots preferred, windows as fallback) ----
-          // v23.1 custom window: slot = { hour, minute, exact, endHour, endMinute }
-          //   exact=true  -> upload at HH:MM sharp
-          //   exact=false -> ONE deterministic random minute between start (hour:minute) and end (endHour:endMinute),
-          //                  chosen once per day per slot (hash) so every ping agrees on the target.
-          //   Legacy slots without an end keep the classic 3 h window. The gate sleeps until the target minute
-          //   when the ping comes early and catches up on the next ping when one was missed.
-          const clampEnd = (startMin) => Math.min(23 * 60 + 59, startMin + WINDOW_HOURS * 60);
-          const toSlots = (hours) => hours.map(x => { const e = clampEnd(x * 60); return { hour: x, minute: 0, exact: false, endHour: Math.floor(e / 60), endMinute: e % 60 }; });
-          const normSlot = (x) => {
-            if (!x || typeof x !== "object") return null;
-            const hour = Number(x.hour), minute = Number(x.minute) || 0, exact = x.exact === true;
-            if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) return null;
-            let endHour = Number(x.endHour), endMinute = Number(x.endMinute) || 0;
-            const okEnd = Number.isInteger(endHour) && endHour >= 0 && endHour <= 23 && Number.isInteger(endMinute) && endMinute >= 0 && endMinute <= 59 && endHour * 60 + endMinute > hour * 60 + minute;
-            if (exact) { endHour = hour; endMinute = minute; }
-            else if (!okEnd) { const e = clampEnd(hour * 60 + minute); endHour = Math.floor(e / 60); endMinute = e % 60; }
-            return { hour, minute, exact, endHour, endMinute };
-          };
-          let EXACT_LEAD_MIN = 6;                      // v26.2: minutes the gate releases early for exact slots (dashboardSettings/schedule.exactLeadMin, 0-25)
-          let slots = toSlots(DEFAULT_WINDOWS), source = "yml-default";
+          let windows = DEFAULT_WINDOWS, source = "yml-default";
           try {
             const s = await jget("dashboardSettings/schedule");
             const w = s && Array.isArray(s.windows) ? s.windows.map(Number).filter(x => Number.isInteger(x) && x >= 0 && x <= 23) : null;
-            const sl = s && Array.isArray(s.slots) ? s.slots.map(normSlot).filter(Boolean) : null;
-            const lm = s ? Number(s.exactLeadMin) : NaN; if (Number.isFinite(lm)) EXACT_LEAD_MIN = Math.max(0, Math.min(25, Math.round(lm)));
-            if (sl && sl.length) { slots = sl; source = "firebase-slots"; }
-            else if (w && w.length) { slots = toSlots(w); source = "firebase"; }
+            if (w && w.length) { windows = w; source = "firebase"; }
           } catch (e) { console.log("Schedule read failed (" + e.message + ") - using yml defaults."); }
-          const startOf = (s) => s.hour * 60 + s.minute, endOf = (s) => s.exact ? startOf(s) : s.endHour * 60 + s.endMinute;
-          slots.sort((a, b) => startOf(a) - startOf(b));
-          const windows = slots.map(s => s.hour);
-          const hashOf = (i) => { let hash = 0; const seed = dateKey + "#" + i + "#" + ACCOUNT; for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0; return hash; };
-          const targetOf = (s, i) => s.exact ? startOf(s) : startOf(s) + (hashOf(i) % Math.max(1, endOf(s) - startOf(s)));
 
           let runsToday = {}, runsKnown = false;
           try { runsToday = (await jget(`dashboardSettings/gate/runs/${dateKey}`)) || {}; runsKnown = true; }
           catch (e) { console.log("Run log read failed (" + e.message + ") - catch-up disabled for this ping."); }
 
-          const now = h * 60 + m;
-          // active from the slot start until its end (+ one ping of slack so a missed final ping can still catch up)
-          // v26.2 exact-time fix:
-          //  (1) an exact slot is "active" one ping BEFORE its minute, so the early ping sleeps instead of falling
-          //      through to "outside" (that bug made every exact upload run on the NEXT ping = 10-30 min late);
-          //  (2) exact slots release EXACT_LEAD_MIN minutes early so checkout/Playwright/login/generation finish first,
-          //      and bot.js holds the Publish click until HH:MM Dhaka sharp (EXACT_TARGET_DHAKA env).
-          const leadOf = (s) => s.exact ? EXACT_LEAD_MIN : 0;
-          const fireOf = (s, i) => targetOf(s, i) - leadOf(s);
-          const isActive = (s, i) => now >= Math.min(startOf(s), fireOf(s, i) - SLOT_MIN) && now < Math.max(endOf(s), targetOf(s, i)) + SLOT_MIN;
-          let wIdx = slots.findIndex((s, i) => isActive(s, i) && !(runsToday && runsToday[i]));   // prefer an active slot that has not run yet
-          if (wIdx < 0) wIdx = slots.findIndex(isActive);
-          let decision = "outside", go = false, curSlot = -1, chosen = -1, waitMin = 0, exact = false, target = "", targetMin = -1, fireMin = -1;
+          const wIdx = windows.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
+          const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
+          let decision = "outside", go = false, curSlot = -1, chosen = -1;
           if (wIdx >= 0) {
-            const slot = slots[wIdx];
-            exact = slot.exact === true;
-            targetMin = targetOf(slot, wIdx);
-            fireMin = fireOf(slot, wIdx);
-            target = pad2(Math.floor(targetMin / 60)) + ":" + pad2(targetMin % 60);
-            curSlot = Math.floor((now - startOf(slot)) / SLOT_MIN);
-            chosen = Math.floor((targetMin - startOf(slot)) / SLOT_MIN);
-            if (runsToday && runsToday[wIdx]) decision = "done";                        // this slot already ran today
-            else if (now >= fireMin) {
-              if (now - fireMin < SLOT_MIN) { decision = "run"; go = true; }
-              else if (runsKnown) { decision = "catch-up"; go = true; }               // the ping that should have fired was missed
-              else decision = "wait";
-            }
-            else if (fireMin - now < SLOT_MIN) { decision = "run"; go = true; waitMin = fireMin - now; }   // early ping -> sleep until the release minute
+            const minsIn = (h - windows[wIdx]) * 60 + m;
+            curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
+            let hash = 0;
+            const seed = dateKey + "#" + wIdx + "#" + ACCOUNT;
+            for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+            chosen = hash % slotsPerWindow;
+            if (runsToday && runsToday[wIdx]) decision = "done";                 // this window already ran today
+            else if (curSlot === chosen) { decision = "run"; go = true; }
+            else if (curSlot > chosen && runsKnown) { decision = "catch-up"; go = true; }  // chosen slot was missed -> run now
             else decision = "wait";
           }
-          const slotDesc = slots.map((s, i) => `S${i + 1} ${pad2(s.hour)}:${pad2(s.minute)}${s.exact ? " exact" : "-" + pad2(s.endHour) + ":" + pad2(s.endMinute) + " random"}`).join(", ");
-          console.log(`Date ${dateKey} ${hhmm} (Dhaka) | slots [${slotDesc}] (${source}) | slot ${wIdx}${wIdx >= 0 ? ` | target ${target} (${exact ? "exact" : "random in range"})` : ""} | decision: ${decision}${waitMin ? ` (sleeping ${waitMin} min until ${pad2(Math.floor(fireMin / 60)) + ":" + pad2(fireMin % 60)}${exact ? ", publish at " + target : ""})` : ""}`);
+          console.log(`Date ${dateKey} ${hhmm} (Dhaka) | windows ${JSON.stringify(windows)} (${source}) | window ${wIdx} | chosen slot ${chosen} | current slot ${curSlot} | decision: ${decision}`);
 
           try {
-            await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, slotsUsed: slots, windowsSource: source, lastRunId: RUN_ID, lastMode: wIdx >= 0 ? (exact ? "exact" : "random") : null });
+            await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, windowsSource: source, lastRunId: RUN_ID });
           } catch (e) { console.log("Health log failed: " + e.message); }
 
           if (go) {
             try {
               const all = (await jget("dashboardSettings/gate/runs")) || {};
               const today = Object.assign({}, all[dateKey] || {});
-              today[wIdx] = { at: Date.now() + waitMin * 60000, dhaka: exact ? target : (waitMin ? target : hhmm), slot: curSlot, chosen, exact, target, lead: exact ? EXACT_LEAD_MIN : 0, catchUp: decision === "catch-up", runId: RUN_ID };
+              today[wIdx] = { at: Date.now(), dhaka: hhmm, slot: curSlot, chosen, catchUp: decision === "catch-up", runId: RUN_ID };
               await jwrite("dashboardSettings/gate/runs", "PUT", { [dateKey]: today });   // keeps only today
-              await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now() + waitMin * 60000, lastRunDhaka: `${dateKey} ${waitMin ? target : hhmm}`, lastRunWindow: wIdx });
+              await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now(), lastRunDhaka: `${dateKey} ${hhmm}`, lastRunWindow: wIdx });
             } catch (e) { console.log("Run marker failed: " + e.message); }
-            if (waitMin > 0) {
-              console.log(exact ? `Waiting ${waitMin} min - releasing ${EXACT_LEAD_MIN} min early so the Publish click lands at ${target} Dhaka sharp...` : `Waiting ${waitMin} min so the upload starts at ${target} Dhaka...`);
-              await new Promise(r => setTimeout(r, waitMin * 60 * 1000));
-            }
-            if (exact) setOutput("target", target);   // v26.2: bot.js holds Publish until this HH:MM (Dhaka)
-            setOutput("exact", "yes");   // v23.1: gate already picked the minute -> skip the extra random delay in both modes
           }
           process.exit(go ? 0 : 2);
           GATE_EOF
@@ -213,16 +136,14 @@ jobs:
 
   automation:
     needs: gate
-    # v24: normal run needs the gate's OK; a vpn_test run bypasses the gate and only executes the VPN steps
-    if: ${{ !cancelled() && ((needs.gate.result == 'success' && needs.gate.outputs.go == 'yes') || inputs.run_mode == 'vpn_test') }}
+    if: needs.gate.outputs.go == 'yes'
     runs-on: ${{ inputs.os }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Random minute-level delay (human-like timing)
-        # v23: skipped when the slot has an exact upload time - the gate already waited for HH:MM sharp
-        if: inputs.run_mode != 'vpn_test' && inputs.force_run != 'true' && needs.gate.outputs.exact != 'yes'
+        if: inputs.force_run != 'true'
         shell: bash
         run: |
           DELAY=$((RANDOM % 840))
@@ -234,7 +155,6 @@ jobs:
           node-version: 20
 
       - name: Install Playwright
-        if: inputs.run_mode != 'vpn_test'
         shell: pwsh
         run: |
           npm init -y
@@ -242,7 +162,6 @@ jobs:
           npx playwright install chromium
 
       - name: 🎬 Install ffmpeg (Telegram videos as MP4)
-        if: inputs.run_mode != 'vpn_test'
         shell: pwsh
         continue-on-error: true
         run: |
@@ -284,7 +203,6 @@ jobs:
           }
 
       - name: 🎲 Randomize Machine Identity
-        if: inputs.run_mode != 'vpn_test'
         shell: pwsh
         run: |
           Write-Host "============================================================"
@@ -378,7 +296,6 @@ jobs:
           Write-Host "============================================================"
 
       - name: Collect Device Info
-        if: inputs.run_mode != 'vpn_test'
         shell: pwsh
         run: |
           Write-Host "============================================================"
@@ -506,454 +423,7 @@ jobs:
           Write-Host "  ✅  Device Info Collection Complete"
           Write-Host "============================================================"
 
-      # ------------------------------------------------------------------
-      # v24 · OpenVPN / WireGuard support. Profiles + mode are stored in Firebase
-      # (dashboardSettings/vpn) and managed from the web panel / Android app.
-      # run_mode=vpn_test -> only these steps run and the result is reported
-      # back to Firebase (lastTest), the step summary and Telegram.
-      # ------------------------------------------------------------------
-      - name: 🔐 Create vpn.mjs (OpenVPN / WireGuard helper)
-        shell: pwsh
-        run: |
-          @'
-          // ============================================================================
-          //  vpn.mjs  -  OpenVPN / WireGuard tunnel helper for the Zedge automation runner
-          //  v24 - profiles live in Firebase RTDB at  dashboardSettings/vpn  (per account)
-          //
-          //    node vpn.mjs connect     -> main automation: bring the tunnel up (or skip when disabled)
-          //    node vpn.mjs test        -> panel/app "Test VPN": connect, verify, report, disconnect
-          //    node vpn.mjs disconnect  -> tear the tunnel down (idempotent)
-          //
-          //  Firebase layout (per account database):
-          //    dashboardSettings/vpn/mode              "none" | "openvpn" | "wireguard"   ("none" = proxy / direct as before)
-          //    dashboardSettings/vpn/activeProfileId   id of the profile used by real runs
-          //    dashboardSettings/vpn/keepProxy         true -> HTTP proxy inputs stay active inside the tunnel
-          //    dashboardSettings/vpn/profiles/<id>     { name, type, config, username, password, ca, cert, key, tlsAuth, tlsCrypt, extra }
-          //    dashboardSettings/vpn/lastTest          result written by "test"
-          //    dashboardSettings/vpn/lastRun           result written by "connect"
-          // ============================================================================
-          import fs from "fs";
-          import os from "os";
-          import path from "path";
-          import { spawn, spawnSync } from "child_process";
-
-          const MODE = (process.argv[2] || "connect").toLowerCase();
-          const DB = (process.env.FIREBASE_DB_URL || "").replace(/\/+$/, "");
-          const ACCOUNT = process.env.ACCOUNT_LABEL || "ZEDGE";
-
-          const PROFILE_OVERRIDE = (process.env.VPN_PROFILE || "").trim();
-          const VPN_PATH = "dashboardSettings/vpn";
-          const IS_WIN = process.platform === "win32";
-          const WORK = path.join(process.env.RUNNER_TEMP || os.tmpdir(), "zedge-vpn");
-          const STATE_FILE = path.join(WORK, "state.json");
-          const RUN_ID = process.env.GITHUB_RUN_ID || "";
-          const RUN_URL = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && RUN_ID
-            ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${RUN_ID}` : "";
-          const OVPN_DIR = "C:\\Program Files\\OpenVPN";
-          const WG_DIR = "C:\\Program Files\\WireGuard";
-          const WG_TUNNEL = "zedgewg";
-          const LOG_LINES = [];
-
-          fs.mkdirSync(WORK, { recursive: true });
-
-          // ---------------------------------------------------------------- utilities
-          const ts = () => new Date().toISOString().slice(11, 19);
-          function log(msg) { const line = `[${ts()}] ${msg}`; console.log(line); LOG_LINES.push(line); if (LOG_LINES.length > 400) LOG_LINES.shift(); }
-          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-          const mask = (s) => (s ? String(s).slice(0, 2) + "***" : "");
-
-          function setEnv(k, v) { try { if (process.env.GITHUB_ENV) fs.appendFileSync(process.env.GITHUB_ENV, `${k}=${v}\n`); } catch (_) {} }
-          function setOutput(k, v) { try { if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `${k}=${v}\n`); } catch (_) {} }
-          function summary(md) { try { if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n"); } catch (_) {} }
-
-          async function fetchTimeout(url, opts = {}, ms = 15000) {
-            const ctrl = new AbortController();
-            const t = setTimeout(() => ctrl.abort(), ms);
-            try { return await fetch(url, { ...opts, signal: ctrl.signal }); } finally { clearTimeout(t); }
-          }
-          async function jget(p) {
-            if (!DB) throw new Error("FIREBASE_DB_URL is not set");
-            const r = await fetchTimeout(`${DB}/${p}.json`, {}, 20000);
-            if (!r.ok) throw new Error(`Firebase GET ${p} -> HTTP ${r.status}`);
-            return r.json();
-          }
-          async function jpatch(p, body) {
-            try {
-              const r = await fetchTimeout(`${DB}/${p}.json`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 20000);
-              if (!r.ok) log(`⚠️ Firebase PATCH ${p} -> HTTP ${r.status}`);
-            } catch (e) { log(`⚠️ Firebase PATCH ${p} failed: ${e.message}`); }
-          }
-
-          function run(cmd, args, opts = {}) {
-            const r = spawnSync(cmd, args, { encoding: "utf8", windowsHide: true, timeout: opts.timeout || 10 * 60 * 1000, ...opts });
-            return { code: r.status, out: (r.stdout || "") + (r.stderr || ""), error: r.error };
-          }
-          function ps(script, timeout) { return run("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], { timeout }); }
-          function sh(cmd, timeout) { return run("bash", ["-lc", cmd], { timeout }); }
-          function tail(file, n = 40) { try { return fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).slice(-n).join("\n"); } catch (_) { return ""; } }
-          function readState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch (_) { return null; } }
-          function writeState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s)); }
-
-          // ------------------------------------------------------------ public IP probe
-          async function publicIp() {
-            const probes = [
-              { url: "https://ipinfo.io/json", map: (j) => ({ ip: j.ip, country: j.country, city: j.city, region: j.region, org: j.org, timezone: j.timezone }) },
-              { url: "https://ipapi.co/json/", map: (j) => ({ ip: j.ip, country: j.country_code, city: j.city, region: j.region, org: j.org, timezone: j.timezone }) },
-              { url: "https://api.ipify.org?format=json", map: (j) => ({ ip: j.ip }) },
-            ];
-            let lastErr = "";
-            for (const p of probes) {
-              try {
-                const r = await fetchTimeout(p.url, { headers: { "User-Agent": "curl/8.0" } }, 15000);
-                if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                const j = await r.json();
-                const info = p.map(j);
-                if (info && info.ip) return info;
-              } catch (e) { lastErr = `${p.url}: ${e.message}`; }
-            }
-            throw new Error(`public IP lookup failed (${lastErr})`);
-          }
-          async function zedgeCheck() {
-            try {
-              const r = await fetchTimeout("https://www.zedge.net/", { method: "GET", redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" } }, 25000);
-              return { ok: r.status < 500, status: r.status };
-            } catch (e) { return { ok: false, status: 0, error: e.message }; }
-          }
-          function fmtIp(i) { return i ? `${i.ip}${i.country ? ` (${[i.city, i.region, i.country].filter(Boolean).join(", ")})` : ""}${i.org ? ` · ${i.org}` : ""}` : "-"; }
-
-          // ------------------------------------------------------------- profile load
-          async function loadProfile() {
-            const data = (await jget(VPN_PATH)) || {};
-            const profiles = data.profiles || {};
-            const wantId = PROFILE_OVERRIDE || data.activeProfileId || "";
-            if (!PROFILE_OVERRIDE) {
-              const mode = String(data.mode || "none").toLowerCase();
-              if (mode === "none" || mode === "proxy" || !wantId) return { disabled: true, reason: !wantId ? "no active profile" : `mode = ${mode}`, data };
-            }
-            const profile = profiles[wantId];
-            if (!profile) throw new Error(`VPN profile "${wantId}" not found under ${VPN_PATH}/profiles (save it from the panel / app first)`);
-            const type = String(profile.type || "").toLowerCase() === "wireguard" ? "wireguard" : "openvpn";
-            return { disabled: false, id: wantId, type, profile: { ...profile, type }, data };
-          }
-
-          // ------------------------------------------------------------ OpenVPN files
-          /** Builds a self-contained .ovpn: inlines uploaded certificates, wires auth-user-pass, adds runner safety routes. */
-          function buildOvpn(profile, dir) {
-            let cfg = String(profile.config || "").replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "");
-            if (!cfg.trim()) throw new Error("OpenVPN profile has an empty .ovpn config");
-            if (!/^\s*(remote|remote-random|<connection>)/m.test(cfg)) throw new Error(".ovpn has no 'remote' line - is this really an OpenVPN client config?");
-            const hasBlock = (tag) => new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "i").test(cfg);
-            const dropDirective = (name) => { cfg = cfg.replace(new RegExp(`^[ \\t]*${name}[ \\t]+[^\\n]*\\n?`, "gmi"), ""); };
-            const notes = [];
-
-            // ---- certificates / keys uploaded separately -> inline blocks ----
-            const inlines = [["ca", "ca"], ["cert", "cert"], ["key", "key"], ["tlsAuth", "tls-auth"], ["tlsCrypt", "tls-crypt"]];
-            for (const [field, tag] of inlines) {
-              const body = String(profile[field] || "").replace(/\r\n?/g, "\n").trim();
-              if (!body) continue;
-              if (tag === "tls-auth") {
-                const m = cfg.match(/^[ \t]*tls-auth[ \t]+\S+[ \t]+([01])/mi);
-                if (m && !/^\s*key-direction/m.test(cfg)) cfg += `\nkey-direction ${m[1]}\n`;
-              }
-              cfg = cfg.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>\\n?`, "gi"), "");
-              dropDirective(tag);
-              cfg += `\n<${tag}>\n${body}\n</${tag}>\n`;
-              notes.push(`${tag} inlined from upload`);
-            }
-
-            // ---- external file references that we cannot satisfy ----
-            const fileDirectives = ["ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2", "pkcs12", "dh", "crl-verify", "extra-certs", "secret"];
-            const missing = [];
-            for (const d of fileDirectives) {
-              const re = new RegExp(`^[ \\t]*${d}[ \\t]+([^\\s#]+)`, "gmi");
-              let m;
-              while ((m = re.exec(cfg))) {
-                const f = m[1].replace(/^['"]|['"]$/g, "");
-                if (f === "[inline]") continue;
-                if (hasBlock(d)) { dropDirective(d); continue; }
-                missing.push(`${d} ${f}`);
-              }
-            }
-            if (missing.length) throw new Error(`.ovpn references external file(s) that were not uploaded: ${missing.join(", ")}. Add them in the VPN card (CA / Cert / Key / TLS fields) or paste an inline (.ovpn with <ca>...</ca>) config.`);
-
-            // ---- username / password ----
-            const user = String(profile.username || "").trim();
-            const pass = String(profile.password || "");
-            const wantsAuth = /^[ \t]*auth-user-pass\b/m.test(cfg);
-            if (wantsAuth && !user) throw new Error("This .ovpn requires a username/password (auth-user-pass) but none is saved in the profile.");
-            if (user) {
-              dropDirective("auth-user-pass");
-              cfg = cfg.replace(/^[ \t]*auth-user-pass[ \t]*$/gmi, "");
-              fs.writeFileSync(path.join(dir, "auth.txt"), `${user}\n${pass}\n`, { mode: 0o600 });
-              cfg += `\nauth-user-pass auth.txt\nauth-nocache\n`;
-              notes.push(`credentials: ${mask(user)}`);
-            } else notes.push("certificate-only login (no username/password)");
-
-            // ---- interactive / unsafe directives ----
-            for (const d of ["askpass", "management", "management-query-passwords", "daemon", "log", "log-append", "status", "writepid", "up", "down", "route-up", "ipchange", "client-connect", "user", "group", "chroot"]) dropDirective(d);
-            cfg = cfg.replace(/^[ \t]*(daemon|management-query-passwords|auth-retry[ \t]+interact)[ \t]*$/gmi, "");
-
-            // ---- runner safety: keep the cloud DNS/metadata reachable, tunnel DNS, no prompts ----
-            const extra = ["", "# --- added by zedge automation (v24) ---", "auth-retry none", "connect-retry 3 10", "connect-timeout 25", "resolv-retry 30", "server-poll-timeout 25", "verb 3", "mute-replay-warnings", "suppress-timestamps"];
-            if (!/^\s*explicit-exit-notify/m.test(cfg) && /^\s*proto\s+udp/mi.test(cfg)) extra.push("explicit-exit-notify 1");
-            if (IS_WIN) extra.push("route 168.63.129.16 255.255.255.255 net_gateway");    // Azure DNS / metadata stays on the LAN
-            if (!/^\s*dhcp-option\s+DNS/mi.test(cfg)) extra.push("dhcp-option DNS 1.1.1.1", "dhcp-option DNS 8.8.8.8");
-            if (String(profile.extra || "").trim()) extra.push("# --- profile extra lines ---", String(profile.extra).replace(/\r\n?/g, "\n").trim());
-            if (!/^\s*redirect-gateway/m.test(cfg)) notes.push("no redirect-gateway in config (server should push it - IP change is verified after connect)");
-            cfg = cfg.trimEnd() + "\n" + extra.join("\n") + "\n";
-            fs.writeFileSync(path.join(dir, "zedge.ovpn"), cfg, { mode: 0o600 });
-            return notes;
-          }
-
-          // ------------------------------------------------------------- WireGuard
-          function buildWg(profile, dir) {
-            let cfg = String(profile.config || "").replace(/\r\n?/g, "\n").replace(/^\uFEFF/, "").trim();
-            if (!cfg) throw new Error("WireGuard profile has an empty config");
-            if (!/^\s*\[Interface\]/mi.test(cfg) || !/^\s*\[Peer\]/mi.test(cfg)) throw new Error("WireGuard config needs both [Interface] and [Peer] sections");
-            if (!/^\s*PrivateKey\s*=/mi.test(cfg)) throw new Error("WireGuard config is missing PrivateKey");
-            if (!/^\s*Endpoint\s*=/mi.test(cfg)) throw new Error("WireGuard config is missing Endpoint");
-            const notes = [];
-            if (!/^\s*DNS\s*=/mi.test(cfg)) { cfg = cfg.replace(/^\s*\[Interface\]\s*$/mi, "[Interface]\nDNS = 1.1.1.1, 8.8.8.8"); notes.push("DNS 1.1.1.1 added"); }
-            if (!/AllowedIPs\s*=.*0\.0\.0\.0\/0/i.test(cfg)) notes.push("AllowedIPs does not cover 0.0.0.0/0 - only part of the traffic will use the tunnel");
-            if (String(profile.extra || "").trim()) cfg += "\n" + String(profile.extra).replace(/\r\n?/g, "\n").trim();
-            fs.writeFileSync(path.join(dir, `${WG_TUNNEL}.conf`), cfg + "\n", { mode: 0o600 });
-            return notes;
-          }
-
-          // ----------------------------------------------------------- installers
-          function ensureOpenVpn() {
-            if (IS_WIN) {
-              const exe = path.join(OVPN_DIR, "bin", "openvpn.exe");
-              if (fs.existsSync(exe)) return exe;
-              log("📦 Installing OpenVPN (chocolatey)...");
-              const r = ps("choco install openvpn -y --no-progress --limit-output | Out-Null; exit $LASTEXITCODE", 8 * 60 * 1000);
-              if (!fs.existsSync(exe)) throw new Error(`OpenVPN install failed (exit ${r.code}): ${r.out.slice(-400)}`);
-              return exe;
-            }
-            if (run("which", ["openvpn"]).code !== 0) {
-              log("📦 Installing OpenVPN (apt)...");
-              const r = sh("sudo apt-get update -qq && sudo apt-get install -y -qq openvpn", 6 * 60 * 1000);
-              if (r.code !== 0) throw new Error(`OpenVPN install failed: ${r.out.slice(-400)}`);
-            }
-            return "openvpn";
-          }
-          function ensureWireGuard() {
-            if (IS_WIN) {
-              const exe = path.join(WG_DIR, "wireguard.exe");
-              if (fs.existsSync(exe)) return exe;
-              log("📦 Installing WireGuard (chocolatey)...");
-              const r = ps("choco install wireguard -y --no-progress --limit-output | Out-Null; exit $LASTEXITCODE", 8 * 60 * 1000);
-              if (!fs.existsSync(exe)) throw new Error(`WireGuard install failed (exit ${r.code}): ${r.out.slice(-400)}`);
-              return exe;
-            }
-            if (run("which", ["wg-quick"]).code !== 0) {
-              log("📦 Installing WireGuard (apt)...");
-              const r = sh("sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools resolvconf", 6 * 60 * 1000);
-              if (r.code !== 0) throw new Error(`WireGuard install failed: ${r.out.slice(-400)}`);
-            }
-            return "wg-quick";
-          }
-
-          // ------------------------------------------------------------- connect
-          async function connectOpenVpn(profile) {
-            const notes = buildOvpn(profile, WORK);
-            notes.forEach((n) => log(`   · ${n}`));
-            const exe = ensureOpenVpn();
-            const logFile = path.join(WORK, "openvpn.log");
-            try { fs.unlinkSync(logFile); } catch (_) {}
-            let child;
-            if (IS_WIN) {
-              child = spawn(exe, ["--config", "zedge.ovpn", "--log", logFile], { cwd: WORK, detached: true, stdio: "ignore", windowsHide: true });
-            } else {
-              child = spawn("sudo", ["openvpn", "--config", "zedge.ovpn", "--log", logFile], { cwd: WORK, detached: true, stdio: "ignore" });
-            }
-            child.unref();
-            writeState({ type: "openvpn", pid: child.pid, logFile, exe });
-            log(`🚀 OpenVPN started (pid ${child.pid}), waiting for the tunnel...`);
-            const deadline = Date.now() + 100 * 1000;
-            while (Date.now() < deadline) {
-              await sleep(2000);
-              const text = (() => { try { return fs.readFileSync(logFile, "utf8"); } catch (_) { return ""; } })();
-              if (/Initialization Sequence Completed/.test(text)) { log("✅ OpenVPN: Initialization Sequence Completed"); return; }
-              const fatal = [
-                [/AUTH_FAILED|auth-failure/i, "authentication failed - wrong username/password (or the account is expired / device limit reached)"],
-                [/TLS Error: TLS key negotiation failed|TLS handshake failed/i, "TLS handshake failed - server unreachable, wrong port/proto, or CA/TLS-auth key does not match"],
-                [/Cannot resolve host address|RESOLVE:/i, "cannot resolve the VPN server hostname"],
-                [/Options error/i, "OpenVPN options error - the .ovpn has an unsupported / misspelled directive"],
-                [/Cannot load (certificate|private key|CA)|error:0[0-9A-F]+:PEM/i, "certificate / key could not be loaded - check CA / cert / key content"],
-                [/All (TAP-Windows|wintun|TAP) adapters on this system are currently in use|There are no TAP-Windows|no TAP adapters/i, "no TAP/Wintun adapter available on the runner"],
-                [/Exiting due to fatal error|process exiting/i, "OpenVPN exited"],
-              ];
-              for (const [re, why] of fatal) if (re.test(text)) throw new Error(`OpenVPN: ${why}\n--- openvpn.log ---\n${tail(logFile, 25)}`);
-              if (IS_WIN) { const alive = ps(`if (Get-Process -Id ${child.pid} -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }`).out.trim(); if (alive === "no" && !text.includes("Initialization Sequence Completed")) throw new Error(`OpenVPN process exited early\n--- openvpn.log ---\n${tail(logFile, 25)}`); }
-            }
-            throw new Error(`OpenVPN did not finish connecting within 100 s\n--- openvpn.log ---\n${tail(logFile, 25)}`);
-          }
-
-          async function connectWireGuard(profile) {
-            const notes = buildWg(profile, WORK);
-            notes.forEach((n) => log(`   · ${n}`));
-            const exe = ensureWireGuard();
-            const conf = path.join(WORK, `${WG_TUNNEL}.conf`);
-            if (IS_WIN) {
-              ps(`& "${exe}" /uninstalltunnelservice ${WG_TUNNEL}`); await sleep(1500);
-              const r = ps(`& "${exe}" /installtunnelservice "${conf}"; exit $LASTEXITCODE`, 60000);
-              if (r.code !== 0) throw new Error(`WireGuard service install failed (exit ${r.code}): ${r.out.slice(-400)}`);
-              writeState({ type: "wireguard", exe, conf });
-              log("🚀 WireGuard tunnel service installed, waiting for handshake...");
-              const wg = path.join(WG_DIR, "wg.exe");
-              const deadline = Date.now() + 45 * 1000;
-              while (Date.now() < deadline) {
-                await sleep(2000);
-                const s = run(wg, ["show", WG_TUNNEL]).out || "";
-                if (/latest handshake/i.test(s)) { log("✅ WireGuard handshake completed"); return; }
-              }
-              const svc = ps(`(Get-Service -Name 'WireGuardTunnel$${WG_TUNNEL}' -ErrorAction SilentlyContinue).Status`).out.trim();
-              const evt = ps(`Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='WireGuard'} -MaxEvents 12 -ErrorAction SilentlyContinue | ForEach-Object { $_.Message }`).out.trim().slice(-1200);
-              throw new Error(`WireGuard: no handshake within 45 s (service ${svc || "unknown"}) - wrong keys, endpoint blocked, or UDP port unreachable.\n${evt}`);
-            }
-            sh(`sudo wg-quick down ${conf} 2>/dev/null; true`);
-            const r = sh(`sudo cp "${conf}" /etc/wireguard/${WG_TUNNEL}.conf && sudo chmod 600 /etc/wireguard/${WG_TUNNEL}.conf && sudo wg-quick up ${WG_TUNNEL}`, 60000);
-            if (r.code !== 0) throw new Error(`wg-quick up failed: ${r.out.slice(-600)}`);
-            writeState({ type: "wireguard" });
-            const deadline = Date.now() + 45 * 1000;
-            while (Date.now() < deadline) { await sleep(2000); if (/latest handshake/i.test(sh(`sudo wg show ${WG_TUNNEL}`).out)) { log("✅ WireGuard handshake completed"); return; } }
-            throw new Error("WireGuard: no handshake within 45 s");
-          }
-
-          async function disconnect(quiet = false) {
-            const st = readState();
-            if (!st) { if (!quiet) log("ℹ️ No VPN tunnel state - nothing to disconnect."); return; }
-            try {
-              if (st.type === "openvpn") {
-                if (IS_WIN) { if (st.pid) ps(`Stop-Process -Id ${st.pid} -Force -ErrorAction SilentlyContinue`); ps("Get-Process openvpn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"); }
-                else sh("sudo pkill -f 'openvpn --config zedge.ovpn' || true");
-              } else if (st.type === "wireguard") {
-                if (IS_WIN) ps(`& "${st.exe}" /uninstalltunnelservice ${WG_TUNNEL}`); else sh(`sudo wg-quick down ${WG_TUNNEL} || true`);
-              }
-              log(`🔌 VPN (${st.type}) disconnected.`);
-            } catch (e) { log(`⚠️ disconnect: ${e.message}`); }
-            try { fs.unlinkSync(STATE_FILE); } catch (_) {}
-            try { fs.unlinkSync(path.join(WORK, "auth.txt")); } catch (_) {}
-            try { fs.unlinkSync(path.join(WORK, "zedge.ovpn")); } catch (_) {}
-            try { fs.unlinkSync(path.join(WORK, `${WG_TUNNEL}.conf`)); } catch (_) {}
-          }
-
-          // ------------------------------------------------------------- telegram
-          async function telegram(text) {
-            const tok = process.env.TELEGRAM_BOT_TOKEN, chat = process.env.TELEGRAM_CHAT_ID;
-            if (!tok || !chat) return;
-            try {
-              await fetchTimeout("https://api.telegram.org/bot" + tok + "/sendMessage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chat, text, parse_mode: "HTML", disable_web_page_preview: true }) }, 15000);
-            } catch (_) {}
-          }
-          const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-          const dhakaNow = () => new Date(Date.now() + 6 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 16) + " (Dhaka)";
-
-          // ------------------------------------------------------------- main flows
-          async function connectFlow(isTest) {
-            const started = Date.now();
-            const resultKey = isTest ? "lastTest" : "lastRun";
-            const report = async (patch) => jpatch(`${VPN_PATH}/${resultKey}`, { ...patch, at: Date.now(), runId: RUN_ID, runUrl: RUN_URL, account: ACCOUNT, mode: isTest ? "test" : "run", runner: `${os.platform()} ${os.release()}` });
-
-            log(`🔐 VPN ${isTest ? "TEST" : "connect"} for ${ACCOUNT}  (db: ${DB || "-"})`);
-            let loaded;
-            try { loaded = await loadProfile(); }
-            catch (e) { await report({ status: "fail", stage: "load", message: e.message, profileId: PROFILE_OVERRIDE }); throw e; }
-
-            if (loaded.disabled) {
-              log(`ℹ️ VPN disabled for this account (${loaded.reason}) - proxy / direct connection as before.`);
-              setEnv("VPN_ACTIVE", "0"); setOutput("vpn", "disabled");
-              if (isTest) { await report({ status: "fail", stage: "load", message: `No active VPN profile to test (${loaded.reason}). Save a profile and click Test on it.` }); process.exit(1); }
-              return;
-            }
-            const { id, type, profile, data } = loaded;
-            const name = profile.name || id;
-            log(`📄 Profile: "${name}"  type=${type}  id=${id}`);
-            await report({ status: "running", stage: "connecting", message: `Connecting ${type} profile "${name}"...`, profileId: id, profileName: name, type });
-
-            let ipBefore = null;
-            try { ipBefore = await publicIp(); log(`🌍 Public IP before VPN: ${fmtIp(ipBefore)}`); } catch (e) { log(`⚠️ ${e.message}`); }
-
-            try {
-              if (type === "wireguard") await connectWireGuard(profile); else await connectOpenVpn(profile);
-            } catch (e) {
-              log(`❌ ${e.message}`);
-              await report({ status: "fail", stage: "connect", message: e.message.split("\n")[0], detail: e.message.slice(0, 3000), profileId: id, profileName: name, type, ipBefore, durationMs: Date.now() - started, logTail: LOG_LINES.slice(-40).join("\n") });
-              if (isTest) await telegram([`🔐 <b>VPN টেস্ট ব্যর্থ</b> · ${esc(ACCOUNT)}`, "━━━━━━━━━━━━━━━━", `📄 প্রোফাইল: ${esc(name)} (${type})`, `🧩 কারণ: <code>${esc(e.message.split("\n")[0].slice(0, 300))}</code>`, `🕒 ${dhakaNow()}`, RUN_URL ? `🔎 ${RUN_URL}` : ""].filter(Boolean).join("\n"));
-              await disconnect(true);
-              process.exit(1);
-            }
-
-            // ---- verify: public IP must change, internet + zedge reachable ----
-            await sleep(3000);
-            let ipAfter = null, ipErr = "";
-            for (let i = 0; i < 3 && !ipAfter; i++) { try { ipAfter = await publicIp(); } catch (e) { ipErr = e.message; await sleep(4000); } }
-            const zedge = ipAfter ? await zedgeCheck() : { ok: false, status: 0 };
-            const sameIp = ipBefore && ipAfter && ipBefore.ip === ipAfter.ip;
-            const verdictOk = !!ipAfter && !sameIp && zedge.ok;
-            let message = "";
-            if (!ipAfter) message = `Tunnel is up but the internet is NOT reachable through it (${ipErr}). The VPN server may block traffic, or DNS/routing is broken.`;
-            else if (sameIp) message = "Tunnel is up but the public IP did not change - the config does not route all traffic (missing redirect-gateway / AllowedIPs 0.0.0.0/0).";
-            else if (!zedge.ok) message = `IP changed to ${ipAfter.ip} but zedge.net is not reachable through this VPN (${zedge.error || "HTTP " + zedge.status}).`;
-            else message = `Connected. IP ${ipBefore ? ipBefore.ip : "?"} → ${ipAfter.ip}${ipAfter.country ? " · " + [ipAfter.city, ipAfter.country].filter(Boolean).join(", ") : ""}. zedge.net reachable (HTTP ${zedge.status}).`;
-            log(`🌍 Public IP after VPN: ${fmtIp(ipAfter)}`);
-            log(`${verdictOk ? "✅" : "❌"} ${message}`);
-
-            const durationMs = Date.now() - started;
-            const result = { status: verdictOk ? "ok" : "fail", stage: "verify", message, profileId: id, profileName: name, type, ipBefore, ipAfter, zedgeStatus: zedge.status, zedgeOk: zedge.ok, durationMs, logTail: LOG_LINES.slice(-40).join("\n") };
-            await report(result);
-            summary([
-              `### 🔐 VPN ${isTest ? "test" : "tunnel"} · ${ACCOUNT} · ${verdictOk ? "✅ OK" : "❌ FAILED"}`,
-              "", "| | |", "|---|---|",
-              `| Profile | ${name} (${type}) |`, `| IP before | ${fmtIp(ipBefore)} |`, `| IP after | ${fmtIp(ipAfter)} |`,
-              `| zedge.net | ${zedge.ok ? "reachable" : "NOT reachable"} (HTTP ${zedge.status}) |`, `| Duration | ${Math.round(durationMs / 1000)} s |`, `| Result | ${message} |`,
-            ].join("\n"));
-
-            if (isTest) {
-              await telegram([`🔐 <b>VPN টেস্ট ${verdictOk ? "সফল ✅" : "ব্যর্থ ❌"}</b> · ${esc(ACCOUNT)}`, "━━━━━━━━━━━━━━━━", `📄 প্রোফাইল: ${esc(name)} (${type})`,
-                `🌍 IP: <code>${esc(ipBefore ? ipBefore.ip : "?")}</code> → <code>${esc(ipAfter ? ipAfter.ip : "?")}</code>${ipAfter && ipAfter.country ? " · " + esc([ipAfter.city, ipAfter.country].filter(Boolean).join(", ")) : ""}`,
-                `🟢 zedge.net: ${zedge.ok ? "reachable" : "NOT reachable"}`, `⏱ ${Math.round(durationMs / 1000)}s · 🕒 ${dhakaNow()}`, verdictOk ? "" : `🧩 ${esc(message)}`, RUN_URL ? `🔎 ${RUN_URL}` : ""].filter(Boolean).join("\n"));
-              await disconnect();
-              process.exit(verdictOk ? 0 : 1);
-            }
-            if (!verdictOk) { await disconnect(true); throw new Error(`VPN verification failed - aborting the run so the real IP is never used. ${message}`); }
-            setEnv("VPN_ACTIVE", "1");
-            setEnv("VPN_TYPE", type);
-            setEnv("VPN_PROFILE_NAME", name);
-            setEnv("VPN_KEEP_PROXY", data && data.keepProxy === true ? "1" : "0");
-            setEnv("VPN_PUBLIC_IP", ipAfter.ip);
-            setOutput("vpn", type);
-          }
-
-          (async () => {
-            try {
-              if (MODE === "disconnect") { await disconnect(); return; }
-              await connectFlow(MODE === "test");
-            } catch (e) {
-              console.error(`❌ VPN step failed: ${e.message}`);
-              process.exit(1);
-            }
-          })();
-          '@ | Set-Content -Encoding UTF8 vpn.mjs
-
-      - name: 🔐 VPN tunnel (profile from Firebase dashboardSettings/vpn)
-        id: vpn
-        shell: pwsh
-        timeout-minutes: 15
-        env:
-          FIREBASE_DB_URL: "https://zedge3-1b3dc-default-rtdb.firebaseio.com"
-          ACCOUNT_LABEL: "Zedge 3"
-          RUN_MODE: ${{ inputs.run_mode }}
-          VPN_PROFILE: ${{ inputs.vpn_profile }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
-        run: |
-          if ($env:RUN_MODE -eq 'vpn_test') { node vpn.mjs test } else { node vpn.mjs connect }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Create bot.js
-        if: inputs.run_mode != 'vpn_test'
         shell: pwsh
         run: |
           @'
@@ -968,23 +438,16 @@ jobs:
           const zedgePassword = process.env.ZEDGE_PASSWORD;
           const isHeadless = process.env.HEADLESS === "true";
 
-          const firebaseDatabaseURL = "https://zedge3-1b3dc-default-rtdb.firebaseio.com"; // <-- CONFIG: your Firebase Realtime Database URL for account 3
+          const firebaseDatabaseURL = "https://YOUR-ZEDGE3-PROJECT-default-rtdb.firebaseio.com"; // <-- CONFIG: your Firebase Realtime Database URL for account 3
           const queuePath = "wallpaperQueue";
-          const r2WorkerUrl = "https://tarek.henrydelacruz0t7.workers.dev"; // <-- CONFIG: your Cloudflare R2 worker URL
+          const r2WorkerUrl = "https://YOUR-R2-WORKER.YOUR-SUBDOMAIN.workers.dev"; // <-- CONFIG: your Cloudflare R2 worker URL
 
           if (!zedgeEmail) throw new Error("Zedge email is required");
           if (!zedgePassword) throw new Error("Zedge password is required");
 
-          // v24: when a VPN tunnel is active the whole runner already exits through the VPN.
-          // The HTTP proxy is then ignored unless the user enabled "keep proxy inside VPN" in the panel.
-          const vpnActive = process.env.VPN_ACTIVE === "1";
-          const vpnKeepProxy = process.env.VPN_KEEP_PROXY === "1";
-          if (vpnActive) console.log(`🔐 VPN active: ${process.env.VPN_TYPE} · profile "${process.env.VPN_PROFILE_NAME}" · public IP ${process.env.VPN_PUBLIC_IP}${vpnKeepProxy ? " (HTTP proxy kept inside the tunnel)" : ""}`);
-          const useProxy = proxyServer && proxyServer.trim() !== "" && (!vpnActive || vpnKeepProxy);
-          if (vpnActive && proxyServer && proxyServer.trim() !== "" && !vpnKeepProxy) console.log("🌐 Proxy input ignored because the VPN tunnel is active (enable keepProxy in the VPN card to chain them).");
           // Proxy is optional — only configure if a server was provided
           let proxy = undefined;
-          if (useProxy) {
+          if (proxyServer && proxyServer.trim() !== "") {
             proxy = {
               server: proxyServer.trim().startsWith("http")
                 ? proxyServer.trim()
@@ -996,26 +459,9 @@ jobs:
             }
             console.log(`🌐 Proxy configured: ${proxy.server}`);
           } else {
-            console.log(vpnActive ? "🌐 No HTTP proxy — traffic goes through the VPN tunnel." : "🌐 No proxy configured — running with direct connection.");
+            console.log("🌐 No proxy configured — running with direct connection.");
           }
 
-          // v26.2/v27.5 exact-time publish (bot.js scope): the gate releases a few minutes early; we hold right before the Publish click
-          // until HH:MM (Asia/Dhaka) sharp. Only the first publish of the run is held.
-          const EXACT_TARGET = (process.env.EXACT_TARGET_DHAKA || "").trim();
-          let exactHoldUsed = false;
-          async function waitForExactTarget(stage) {
-            if (exactHoldUsed || !/^\d{2}:\d{2}$/.test(EXACT_TARGET)) return;
-            exactHoldUsed = true;
-            const parts = EXACT_TARGET.split(":").map(Number);
-            const goal = parts[0] * 60 + parts[1];
-            const dhakaNow = () => { const d = new Date(Date.now() + 6 * 3600 * 1000); return d.getUTCHours() * 60 + d.getUTCMinutes() + d.getUTCSeconds() / 60; };
-            let diff = goal - dhakaNow();
-            if (diff <= 0) { console.log("EXACT_TIME => target " + EXACT_TARGET + " Dhaka passed " + Math.abs(diff).toFixed(1) + " min ago - " + stage + " now."); return; }
-            if (diff > 40) { console.log("EXACT_TIME => target " + EXACT_TARGET + " is " + diff.toFixed(0) + " min away (too far, ignoring hold)."); return; }
-            console.log("EXACT_TIME => holding " + diff.toFixed(1) + " min so " + stage + " lands at " + EXACT_TARGET + " Dhaka sharp.");
-            while ((diff = goal - dhakaNow()) > 0) await new Promise(r => setTimeout(r, Math.min(15000, Math.max(250, diff * 60000))));
-            console.log("EXACT_TIME => " + EXACT_TARGET + " reached - " + stage + " now.");
-          }
           async function firebaseGet(pathName) {
             const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`);
             if (!res.ok) throw new Error(`Firebase GET failed: ${res.status}`);
@@ -1214,9 +660,9 @@ jobs:
               else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর";
               else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা";
               else greetingTime = "শুভ রাত্রি";
-              return `হ্যালো তারেক ভাই, ${greetingTime}`;
+              return `হ্যালো শাওন ভাই, ${greetingTime}`;
             } catch (_) {
-              return "হ্যালো তারেক ভাই";
+              return "হ্যালো শাওন ভাই";
             }
           }
 
@@ -1345,63 +791,13 @@ jobs:
             return typeof v === "string" ? v : ((v && v.fileUrl) || "");
           }
 
-          // ── v23 metadata guard helpers ───────────────────────────────────────────
-          // Required for upload: title + tags + category (same rule as the generator + app + panel).
-          function metadataMissingFields(item) {
-            const txt = (v) => Array.isArray(v) ? v.map(x => String(x || "").trim()).filter(Boolean).join(",") : String(v ?? "").trim();
-            const missing = [];
-            if (!txt(item?.title)) missing.push("title");
-            if (!txt(item?.tags)) missing.push("tags");
-            if (!txt(item?.category)) missing.push("category");
-            return missing;
-          }
-          function hasRequiredMetadata(item) { return metadataMissingFields(item).length === 0; }
-
-          async function publishMetadataAlerts(missingEntries) {
-            const items = {};
-            for (const [id, item] of missingEntries) {
-              items[id] = { name: item.name || item.title || id, contentType: getItemContentType(item), missing: metadataMissingFields(item), createdAt: item.createdAt || null };
-            }
-            const ids = Object.keys(items).sort();
-            const key = ids.join("|");
-            if (ids.length) {
-              console.log(`META_MISSING => ${ids.length} queued file(s) skipped (no metadata): ` + ids.map(id => `"${items[id].name}" [${items[id].missing.join(",")}]`).join("; "));
-            }
-            let prev = null;
-            try { prev = await firebaseGet("dashboardSettings/metadataAlerts"); } catch (e) { console.log(`metadataAlerts read failed: ${e.message}`); }
-            try {
-              const res = await fetch(`${firebaseDatabaseURL}/dashboardSettings/metadataAlerts.json`, {
-                method: "PUT", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ count: ids.length, items, key, updatedAt: Date.now(), updatedDhaka: fmtDhakaTime(), runId: process.env.GITHUB_RUN_ID || "", notifiedKey: prev && prev.notifiedKey ? prev.notifiedKey : "" })
-              });
-              if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            } catch (e) { console.log(`metadataAlerts write failed: ${e.message}`); }
-            // Telegram: only when the set of metadata-less files changed (no spam on every run)
-            if (ids.length && (!prev || prev.notifiedKey !== key)) {
-              const lines = ids.slice(0, 10).map(id => `• ${tgEscape(items[id].name)} <i>(${items[id].missing.join(", ")})</i>`);
-              if (ids.length > 10) lines.push(`… এবং আরও ${ids.length - 10} টি`);
-              const msg = [
-                `⚠️ <b>মেটাডাটা নেই - ${ids.length} টি ফাইল আপলোড হবে না</b>`,
-                "━━━━━━━━━━━━━━━━",
-                `📁 প্রজেক্ট: ${tgEscape(process.env.FOLDER_NAME || "Zedge Bot")}`,
-                `🕒 সময়: ${fmtDhakaTime()}`,
-                "📝 ফাইল:",
-                lines.join("\n"),
-                "",
-                "💡 অ্যাপ / প্যানেল থেকে title, tags, category দিন - অথবা generator.yml (metadata mode) চালান। মেটাডাটা না দেওয়া পর্যন্ত এই ফাইলগুলো স্কিপ হবে।"
-              ].join("\n");
-              await sendTelegramNotification(msg);
-              try { await firebasePatch("dashboardSettings/metadataAlerts", { notifiedKey: key, notifiedAt: Date.now() }); } catch (_) {}
-            }
-          }
-
           function hasSetFiles(item) {
             const slots = SET_SLOTS[getItemContentType(item)];
             if (!slots) return false;
             return slots.every(s => slotFileUrl(item, s));
           }
 
-          async function getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked = false, variety = null) {
+          async function getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked = false) {
             console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType}${dayTypeLocked ? " - LOCKED for today" : ""})`);
             console.log(`ACTIVE_DB: ${firebaseDatabaseURL}`);
             const data = await firebaseGet(queuePath);
@@ -1428,19 +824,11 @@ jobs:
               }
             }
 
-            const uploadable = Object.entries(data).filter(([_, item]) =>
+            const allQueued = Object.entries(data).filter(([_, item]) =>
               item &&
               item.status === "queued" &&
               (item.fileBase64 || item.imageBase64 || item.fileUrl || hasSetFiles(item))
             );
-
-            // v23 METADATA GUARD: a file without title / tags / category NEVER goes to Zedge.
-            // Such files stay "queued" (so the generator / app / panel can fill them) but are
-            // invisible to the picker below. The list is published to Firebase so the app + panel
-            // can show a "metadata missing" alert, and Telegram is pinged once per distinct set.
-            const missingMeta = uploadable.filter(([_, item]) => !hasRequiredMetadata(item));
-            const allQueued = uploadable.filter(([_, item]) => hasRequiredMetadata(item));
-            await publishMetadataAlerts(missingMeta);
 
             const typeCounts = {};
             allQueued.forEach(([_, item]) => {
@@ -1485,30 +873,7 @@ jobs:
             let effectiveDayType = dayType;
             let dayTypeSwitchedTo = null;
             let entries = pinnedEntries.length ? pinnedEntries : entriesOfType(wantedType);
-            // v25 MIX MODE (dashboardSettings/variety.enabled): every slot of the day uploads a DIFFERENT
-            // content type. Slot k takes order[k] (order rotates daily so the first slot is not always the
-            // same type). Types already uploaded today are skipped; a type with no stock is skipped for
-            // the next unused type. strict=true -> never repeat a type on the same day (wait instead).
-            let varietyPick = null;
-            if (variety && variety.enabled && !pinnedEntries.length) {
-              const used = Array.isArray(variety.usedToday) ? variety.usedToday : [];
-              const unused = variety.order.filter(t => !used.includes(t));
-              const seq = unused.length ? unused : (variety.strict ? [] : variety.order.slice());
-              let chosen = null;
-              const empty = [];
-              for (const t of seq) { const found = entriesOfType(t); if (found.length) { chosen = { t, found }; break; } empty.push(t); }
-              if (!chosen) {
-                const metaNote = missingMeta.length ? ` NO_METADATA => ${missingMeta.length} file(s) are waiting for metadata and were not counted.` : "";
-                throw new Error(`MIX_MODE_WAIT => mix mode is ON and no queued file exists for any ${variety.strict ? "unused " : ""}type today (used today: [${used.join(", ") || "none"}], empty: [${empty.join(", ")}]). Add files of another type or pin an item.${metaNote}`);
-              }
-              pickedType = chosen.t;
-              entries = chosen.found;
-              varietyPick = chosen.t;
-              console.log(`MIX_MODE => slot ${used.length + 1}: uploading ${chosen.t} (${chosen.found.length} queued). Used today: [${used.join(", ") || "none"}] | order today: ${variety.order.join(" > ")}${empty.length ? ` | skipped (empty): ${empty.join(", ")}` : ""}`);
-            }
-            if (varietyPick) {
-              // handled above - day-type rotation / lock rules do not apply in mix mode
-            } else if (!pinnedEntries.length) {
+            if (!pinnedEntries.length) {
               if (dayTypeLocked) {
                 if (!entries.length) {
                   throw new Error(`DAY_LOCKED => today is a ${dayType} day (locked) and no more ${wantedType} queued. Not switching type mid-day - nothing more to upload today.`);
@@ -1530,8 +895,7 @@ jobs:
                   }
                 }
                 if (!chosen) {
-                  const metaNote = missingMeta.length ? ` NO_METADATA => ${missingMeta.length} file(s) are waiting for metadata and were not counted.` : "";
-                  throw new Error(`WAIT_FOR_STOCK => no content type has a full day of stock (>= ${MIN_STOCK_FOR_DAY}). Waiting: [${waiting.join(", ")}]. Add more files or pin an item manually. Nothing uploaded.${metaNote}`);
+                  throw new Error(`WAIT_FOR_STOCK => no content type has a full day of stock (>= ${MIN_STOCK_FOR_DAY}). Waiting: [${waiting.join(", ")}]. Add more files or pin an item manually. Nothing uploaded.`);
                 }
                 pickedType = chosen.tryType;
                 effectiveDayType = chosen.tryDayType;
@@ -1544,8 +908,7 @@ jobs:
             }
 
             if (!entries.length) {
-              const metaNote = missingMeta.length ? ` NO_METADATA => ${missingMeta.length} queued file(s) skipped because metadata is missing.` : "";
-              throw new Error(`Queue is completely EMPTY - no uploadable item of ANY type found. Queue => ${JSON.stringify(typeCounts)}.${metaNote} DB=${firebaseDatabaseURL}`);
+              throw new Error(`Queue is completely EMPTY - no uploadable item of ANY type found. Queue => ${JSON.stringify(typeCounts)}. DB=${firebaseDatabaseURL}`);
             }
 
             const [id, item] = entries[0];
@@ -1653,7 +1016,6 @@ jobs:
               contentType,
               isMp3,
               dayTypeSwitchedTo,
-              varietyType: varietyPick,
               isPinnedPick,
               name:        item.name || id,
               title:       item.title || "",
@@ -2376,7 +1738,6 @@ jobs:
 
             console.log("Video ad radio selected");
 
-            await waitForExactTarget("Publish");   // v26.2 exact-time hold
             // ── PUBLISH BUTTON ────────────────────────────────────
             console.log("Looking for Publish button");
 
@@ -2385,50 +1746,10 @@ jobs:
               .filter({ hasText: /^Publish$/ })
               .first();
 
-            // v27.5 robust publish: scroll + 3 click strategies + confirm the button is gone
-            let publishClicked = false;
-            try {
-              await publishButton.waitFor({ state: "visible", timeout: 15000 });
-              await publishButton.scrollIntoViewIfNeeded().catch(() => {});
-              await scrollToElement(publishButton).catch(() => {});
-              await page.waitForTimeout(300);
-              await publishButton.click({ timeout: 8000 });
-              publishClicked = true;
-            } catch (e) {
-              console.log("Publish click (primary) failed: " + (e && e.message ? e.message.split("\n")[0] : e));
-            }
-            if (!publishClicked) {
-              await page.mouse.wheel(0, 4000).catch(() => {});
-              await page.waitForTimeout(600);
-              const byRole = page.getByRole("button", { name: /^Publish$/ }).first();
-              try {
-                await byRole.waitFor({ state: "visible", timeout: 8000 });
-                await byRole.scrollIntoViewIfNeeded().catch(() => {});
-                await byRole.click({ timeout: 8000 });
-                publishClicked = true;
-                console.log("Publish clicked via role locator");
-              } catch (e2) {
-                console.log("Publish click (role) failed: " + (e2 && e2.message ? e2.message.split("\n")[0] : e2));
-              }
-            }
-            if (!publishClicked) {
-              publishClicked = await page.evaluate(() => {
-                const btn = Array.from(document.querySelectorAll("button")).find((b) => (b.textContent || "").trim() === "Publish");
-                if (!btn) return false;
-                btn.scrollIntoView({ block: "center" });
-                btn.click();
-                return true;
-              }).catch(() => false);
-              console.log(publishClicked ? "Publish clicked via DOM" : "Publish button not found in DOM");
-            }
-            if (!publishClicked) throw new Error("Publish button could not be clicked - item left as draft");
-            try {
-              await publishButton.waitFor({ state: "hidden", timeout: 15000 });
-            } catch (_) {
-              console.log("Publish button still visible after click - retrying once (force)");
-              await publishButton.click({ force: true, timeout: 5000 }).catch(() => {});
-              await page.waitForTimeout(1500);
-            }
+            await publishButton.waitFor({ state: "visible", timeout: 15000 });
+            await scrollToElement(publishButton);
+            await page.waitForTimeout(300);
+            await publishButton.click();
 
             console.log("Clicked Publish");
           }
@@ -2660,29 +1981,6 @@ jobs:
               let dayType = profileStateData.state.uploadDayType || "AUDIO";
               const DAY_TYPE_LOGS = { AUDIO: "🎵 AUDIO (Ringtone)", WALLPAPER: "🖼️ WALLPAPER (Image)", WALLPAPER_24H: "🌅 DYNAMIC 24H WALLPAPER", WALLPAPER_DUAL: "🔒 DUAL WALLPAPER", WALLPAPER_BATTERY: "🔋 BATTERY WALLPAPER", LIVE_WALLPAPER: "🎬 LIVE WALLPAPER", CHARGING_ANIMATION: "⚡ CHARGING ANIMATION" };
               console.log(`📅 Today's upload type: ${DAY_TYPE_LOGS[dayType] || dayType} day`);
-
-              // ── v25 MIX MODE settings (panel / app -> dashboardSettings/variety) ─────────────
-              //   { enabled: bool, types: ["RINGTONE", "WALLPAPER", ...], strict: bool }
-              //   enabled=false / missing -> classic one-content-type-per-day rotation above.
-              let variety = null;
-              try {
-                const vRaw = await firebaseGet("dashboardSettings/variety");
-                if (vRaw && vRaw.enabled === true) {
-                  const KNOWN_CT = ["RINGTONE", "WALLPAPER", "WALLPAPER_24H", "WALLPAPER_DUAL", "WALLPAPER_BATTERY", "LIVE_WALLPAPER", "CHARGING_ANIMATION"];
-                  let vTypes = Array.isArray(vRaw.types) ? vRaw.types.map(t => String(t || "").toUpperCase().replace(/^AUDIO$/, "RINGTONE")).filter(t => KNOWN_CT.includes(t)) : [];
-                  vTypes = Array.from(new Set(vTypes));
-                  if (vTypes.length < 2) vTypes = KNOWN_CT.slice();
-                  const dhakaDayNo = Math.floor((Date.now() + 6 * 3600 * 1000) / 86400000);
-                  const startAt = dhakaDayNo % vTypes.length;
-                  const order = vTypes.map((_, i) => vTypes[(startAt + i) % vTypes.length]);
-                  const vu = currentState.varietyUsed;
-                  const usedToday = (vu && vu.date === currentState.lastUploadDate && Array.isArray(vu.types)) ? vu.types.slice() : [];
-                  variety = { enabled: true, strict: vRaw.strict === true, types: vTypes, order, usedToday };
-                  console.log(`🎨 MIX MODE ON => 3 slots = 3 different content types. Order today: ${order.join(" > ")} | used today: [${usedToday.join(", ") || "none"}] | strict: ${variety.strict}`);
-                }
-              } catch (vErr) {
-                console.log(`variety settings read failed (${vErr.message}) - using normal day-type mode.`);
-              }
 
               // 2. Filter UA pool by selected group then pick random fingerprint
               const UA_GROUP_SEL = (process.env.UA_GROUP || "random").toLowerCase();
@@ -3145,10 +2443,6 @@ jobs:
                 PUBLISHED: "✅ PUBLISHED", "IN REVIEW": "🔍 IN REVIEW", PENDING: "⏳ PENDING", REJECTED: "⛔ REJECTED", UNKNOWN: "❓ UNKNOWN"
               };
               const ctypeLabel = (qi) => CTYPE_BN[qi?.contentType] || (qi?.isMp3 ? CTYPE_BN.RINGTONE : CTYPE_BN.WALLPAPER);
-              // v25: Telegram day label - mix mode shows the mode + this slot's content type instead of the day type
-              const dayLabelBn = (qi) => (variety && variety.enabled)
-                ? `🎨 মিক্স মোড${qi && qi.varietyType ? " · " + (CTYPE_BN[qi.varietyType] || qi.varietyType) : ""}`
-                : (DAY_TYPE_BN[dayType] || dayType);
               // Card-style message builder: header line + key/value rows + footer
               const tgCard = (header, rows, footer) => {
                 const body = rows.filter(r => r && r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `${k} ${v}`).join("\n");
@@ -3166,7 +2460,7 @@ jobs:
                 try {
                   // Fetch the next queued item
                   const dayTypeLocked = Boolean(currentState.dayTypeLockedDate) && currentState.dayTypeLockedDate === currentState.lastUploadDate;
-                  queueItem = await getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked, variety);
+                  queueItem = await getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked);
                   if (queueItem.dayTypeSwitchedTo && queueItem.dayTypeSwitchedTo !== dayType) {
                     // Keep local state in sync so updateProfileStateAfterUpload() does not
                     // write the OLD day type back to Firebase, and so tomorrow rotates from the new one.
@@ -3190,15 +2484,11 @@ jobs:
                       why = "আজকের কনটেন্ট টাইপের আর কোনো ফাইল কিউতে নেই। দিনের টাইপ লক থাকায় অন্য টাইপ নেওয়া হয়নি।";
                       hint = "💡 আগামীকাল রোটেশন স্বাভাবিকভাবে পরের টাইপে যাবে।";
                     }
-                    if (/NO_METADATA => (\d+)/.test(reason)) {
-                      const n = (reason.match(/NO_METADATA => (\d+)/) || [])[1] || "?";
-                      hint += `\n⚠️ <b>${n} টি ফাইল মেটাডাটা (title/tags/category) না থাকায় স্কিপ হয়েছে</b> - অ্যাপ/প্যানেল থেকে মেটাডাটা দিন।`;
-                    }
                     const idleMsg = tgCard(
                       `ℹ️ <b>আজ কোনো আপলোড হয়নি</b>`,
                       [
                         ["📁 প্রজেক্ট:", tgEscape(runLabel)],
-                        ["📅 আজকের ডে:", dayLabelBn(typeof queueItem !== "undefined" ? queueItem : null)],
+                        ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
                         ["📝 কারণ:", why],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
@@ -3329,12 +2619,7 @@ jobs:
 
                   // LOCK today's day type after the first rotation (non-pinned) upload,
                   // so the type can never switch mid-day.
-                  // v25 MIX MODE: remember which types were uploaded today (so the other slots pick different ones)
-                  if (queueItem.varietyType && variety) {
-                    variety.usedToday.push(queueItem.varietyType);
-                    await firebasePatch("uploadState", { varietyUsed: { date: currentState.lastUploadDate, types: variety.usedToday, updatedAt: Date.now() } });
-                    console.log(`🎨 Mix mode: ${queueItem.varietyType} done - used today: [${variety.usedToday.join(", ")}]`);
-                  } else if (!queueItem.isPinnedPick && currentState.dayTypeLockedDate !== currentState.lastUploadDate) {
+                  if (!queueItem.isPinnedPick && currentState.dayTypeLockedDate !== currentState.lastUploadDate) {
                     await firebasePatch("uploadState", { dayTypeLockedDate: currentState.lastUploadDate });
                     currentState = { ...currentState, dayTypeLockedDate: currentState.lastUploadDate };
                     console.log(`🔒 Day type ${dayType} locked for today.`);
@@ -3368,7 +2653,7 @@ jobs:
                         ["🗂 কনটেন্ট:", fileTypeLabel],
                         ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
                         ["📌 Zedge স্ট্যাটাস:", statusLine],
-                        ["📅 আজকের ডে:", `${dayLabelBn(queueItem)} · আপলোড ${todayProgress}`],
+                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
                       "💡 ফাইলটি কিউ থেকে সরানো হয়েছে এবং আজকের আপলোড লিমিটে গণনা করা হয়েছে। Zedge এটি রিভিউয়ে রেখেছে/রিজেক্ট করেছে — কনটেন্ট গাইডলাইন চেক করে দেখুন।"
@@ -3383,7 +2668,7 @@ jobs:
                         ["🗂 কনটেন্ট:", fileTypeLabel],
                         ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
                         ["📌 Zedge স্ট্যাটাস:", statusLine],
-                        ["📅 আজকের ডে:", `${dayLabelBn(queueItem)} · আপলোড ${todayProgress}`],
+                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
                         ["🕒 সময়:", fmtDhakaTime()]
                       ],
                       publishResult.statusName === "PUBLISHED"
@@ -3483,7 +2768,7 @@ jobs:
                   [
                     ["👋", `${getDhakaGreeting()}।`],
                     ["📁 প্রজেক্ট:", tgEscape(runLabel)],
-                    ["📅 আজকের ডে:", dayLabelBn(typeof queueItem !== "undefined" ? queueItem : null)],
+                    ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
                     ["📊 ফলাফল:", `${published} লাইভ/রিভিউ · ${removedCount} সরানো · ${failedCount} ব্যর্থ (মোট ${attempted})`],
                     ["📈 আজ মোট:", `${currentState.totalUploadsToday}/${DAILY_LIMIT_UI} আপলোড`],
                     ["⏱ সময় লেগেছে:", fmtDuration(Date.now() - runStartedAt)],
@@ -3543,15 +2828,8 @@ jobs:
           '@ | Set-Content bot.js
 
       - name: Run bot
-        if: inputs.run_mode != 'vpn_test'
         shell: pwsh
         env:
-          # v24: set by the VPN step (VPN_ACTIVE=1 when a tunnel is up)
-          VPN_ACTIVE: ${{ env.VPN_ACTIVE }}
-          VPN_TYPE: ${{ env.VPN_TYPE }}
-          VPN_PROFILE_NAME: ${{ env.VPN_PROFILE_NAME }}
-          VPN_PUBLIC_IP: ${{ env.VPN_PUBLIC_IP }}
-          VPN_KEEP_PROXY: ${{ env.VPN_KEEP_PROXY }}
           PROXY_SERVER: ${{ github.event.inputs.proxy_server }}
           PROXY_USER: ${{ github.event.inputs.proxy_user }}
           PROXY_PASS: ${{ github.event.inputs.proxy_pass }}
@@ -3560,16 +2838,9 @@ jobs:
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
-          # Telegram reports go to Tarek bhai's bot by default; repository secrets override if set
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
+          # Optional - create these two repository secrets to receive Telegram reports
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FOLDER_NAME: "Zedge 3"
-          EXACT_TARGET_DHAKA: ${{ needs.gate.outputs.target }}   # v26.2: gate released early, hold Publish until this minute
 
         run: node bot.js
-
-      - name: 🔐 VPN disconnect
-        if: always()
-        continue-on-error: true
-        shell: pwsh
-        run: if (Test-Path vpn.mjs) { node vpn.mjs disconnect }
