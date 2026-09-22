@@ -78,13 +78,28 @@ jobs:
       go: ${{ steps.decide.outputs.go }}
       exact: ${{ steps.decide.outputs.exact }}
       target: ${{ steps.decide.outputs.target }}
+      # v27.11 missed-slot recovery: JSON list of slot indexes this run must upload (1 normally, 2 when a
+      # missed slot is merged into this window), how many that is, and which of them are retries.
+      slots: ${{ steps.decide.outputs.slots }}
+      count: ${{ steps.decide.outputs.count }}
+      retries: ${{ steps.decide.outputs.retries }}
     steps:
-      - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up)
+      - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up, missed-slot recovery)
         id: decide
         shell: bash
+        env:
+          # v27.11: the gate reports a missed slot to Telegram as well (same bot / chat as the upload reports)
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
+          # v27.11.1: passed via env - a `${{ }}` inside this big run block made GitHub reject the workflow
+          # ("Exceeded max expression length 21000"); env values are not subject to that limit.
+          FORCE_RUN: ${{ inputs.force_run }}
         run: |
-          if [ "${{ inputs.force_run }}" = "true" ]; then
+          if [ "$FORCE_RUN" = "true" ]; then
             echo "go=yes" >> "$GITHUB_OUTPUT"
+            echo "slots=[]" >> "$GITHUB_OUTPUT"
+            echo "count=1" >> "$GITHUB_OUTPUT"
+            echo "retries=[]" >> "$GITHUB_OUTPUT"
             echo "Force run enabled - skipping random gate."
             exit 0
           fi
@@ -136,9 +151,11 @@ jobs:
             return { hour, minute, exact, endHour, endMinute };
           };
           let EXACT_LEAD_MIN = 6;                      // v26.2: minutes the gate releases early for exact slots (dashboardSettings/schedule.exactLeadMin, 0-25)
+          let retryEnabled = true;                     // v27.11: dashboardSettings/schedule.retryMissed = false switches missed-slot recovery off
           let slots = toSlots(DEFAULT_WINDOWS), source = "yml-default";
           try {
             const s = await jget("dashboardSettings/schedule");
+            if (s && s.retryMissed === false) retryEnabled = false;
             const w = s && Array.isArray(s.windows) ? s.windows.map(Number).filter(x => Number.isInteger(x) && x >= 0 && x <= 23) : null;
             const sl = s && Array.isArray(s.slots) ? s.slots.map(normSlot).filter(Boolean) : null;
             const lm = s ? Number(s.exactLeadMin) : NaN; if (Number.isFinite(lm)) EXACT_LEAD_MIN = Math.max(0, Math.min(25, Math.round(lm)));
@@ -155,17 +172,66 @@ jobs:
           try { runsToday = (await jget(`dashboardSettings/gate/runs/${dateKey}`)) || {}; runsKnown = true; }
           catch (e) { console.log("Run log read failed (" + e.message + ") - catch-up disabled for this ping."); }
 
+          // ---- v27.11 MISSED-SLOT RECOVERY --------------------------------------------------------------
+          // Until v27.10 a slot counted as "done" the moment the gate released it. If the automation job then
+          // never ran (Actions outage, runner never started, YAML error) or crashed before the file was added
+          // and the Upload button clicked, that slot was silently lost for the day. Now bot.js reports the real
+          // result into the run marker (status: started -> uploaded | failed | idle | skipped-limit) and the gate:
+          //   * treats failed / idle / stale "started" (no result after STALE_RUN_MIN) and never-run-but-window-over
+          //     slots as MISSED,
+          //   * retries a missed slot inside its own window on the next ping,
+          //   * merges a missed slot whose window is already over into the NEXT window's run (that run uploads 2 files),
+          //   * or, when no window is left today, runs it on the next ping (late catch-up) - so the day's 3 uploads
+          //     always happen,
+          //   * notifies panel / app / desktop (dashboardSettings/alerts) + Telegram once per miss,
+          //   * gives up after MAX_ATTEMPTS attempts per slot and never exceeds the 3-uploads-per-day cap.
+          const STALE_RUN_MIN = 70, MAX_ATTEMPTS = 3, DAILY_LIMIT = 3;
+          const todayMDY = `${dhaka.getUTCMonth() + 1}/${dhaka.getUTCDate()}/${dhaka.getUTCFullYear()}`;   // uploadState.lastUploadDate format (bot.js)
+          let uploadsDone = 0;
+          try { const us = await jget("uploadState"); if (us && us.lastUploadDate === todayMDY) uploadsDone = Number(us.totalUploadsToday) || 0; } catch (e) { console.log("uploadState read failed (" + e.message + ")"); }
+          const leadOf = (s) => s.exact ? EXACT_LEAD_MIN : 0;
+          const fireOf = (s, i) => targetOf(s, i) - leadOf(s);
           const now = h * 60 + m;
+          const nowMs = Date.now();
+          const markerOf = (i) => (runsToday && runsToday[i] && typeof runsToday[i] === "object") ? runsToday[i] : null;
+          const windowOver = (i) => now >= endOf(slots[i]) + SLOT_MIN && now >= fireOf(slots[i], i) + SLOT_MIN;
+          // done | running | failed | none   (failed = the slot needs a retry)
+          const slotState = (i) => {
+            const mk = markerOf(i);
+            if (!mk) return windowOver(i) ? "failed" : "none";                                   // never ran and its window is over
+            const st = String(mk.status || "");
+            if (!st) return "done";                                                              // legacy marker (pre v27.11) - nothing to verify
+            if (st === "failed" || st === "idle") return "failed";
+            if (st === "started") return (nowMs - Number(mk.at || 0) > STALE_RUN_MIN * 60000) ? "failed" : "running";
+            return "done";                                                                       // uploaded / skipped-limit / anything else
+          };
+          const attemptsOf = (i) => { const mk = markerOf(i); return mk ? (mk.attempts != null ? Number(mk.attempts) || 0 : 1) : 0; };
+          const reasonOf = (i) => {
+            const mk = markerOf(i);
+            if (!mk) return "the automation run never started (GitHub Actions / workflow issue)";
+            const st = String(mk.status || "");
+            if (st === "started") return "the run started but never reported a result (runner stopped / job crashed)";
+            if (st === "idle") return mk.error ? `nothing was uploaded - ${mk.error}` : "nothing was uploaded (queue empty / no stock)";
+            return mk.error ? `upload failed - ${mk.error}` : "upload failed";
+          };
+          const isBlocked = (i) => { const st = slotState(i); return st === "done" || st === "running"; };   // must not be released again
+          const canRetry = (i) => retryEnabled && runsKnown && slotState(i) === "failed" && attemptsOf(i) < MAX_ATTEMPTS && uploadsDone < DAILY_LIMIT;
+          // v27.11.2: an EXTRA run inside the same window only for a real technical failure and only once. "idle" (nothing to
+          // upload) / "never started" are NOT re-run in the window - they are merged into the next window's run (count=2),
+          // which costs zero extra GitHub Actions minutes. Keeps the daily run count at ~3 like before v27.11.
+          const inWindowRetryOk = (i) => canRetry(i) && String((markerOf(i) || {}).status || "") === "failed" && attemptsOf(i) < 2;
+          const gaveUp = (i) => runsKnown && slotState(i) === "failed" && attemptsOf(i) >= MAX_ATTEMPTS;
+          const hhmmOf = (min) => pad2(Math.floor(min / 60)) + ":" + pad2(min % 60);
+          const slotName = (i) => `Slot ${i + 1} (${hhmmOf(targetOf(slots[i], i))})`;
+
           // active from the slot start until its end (+ one ping of slack so a missed final ping can still catch up)
           // v26.2 exact-time fix:
           //  (1) an exact slot is "active" one ping BEFORE its minute, so the early ping sleeps instead of falling
           //      through to "outside" (that bug made every exact upload run on the NEXT ping = 10-30 min late);
           //  (2) exact slots release EXACT_LEAD_MIN minutes early so checkout/Playwright/login/generation finish first,
           //      and bot.js holds the Publish click until HH:MM Dhaka sharp (EXACT_TARGET_DHAKA env).
-          const leadOf = (s) => s.exact ? EXACT_LEAD_MIN : 0;
-          const fireOf = (s, i) => targetOf(s, i) - leadOf(s);
           const isActive = (s, i) => now >= Math.min(startOf(s), fireOf(s, i) - SLOT_MIN) && now < Math.max(endOf(s), targetOf(s, i)) + SLOT_MIN;
-          let wIdx = slots.findIndex((s, i) => isActive(s, i) && !(runsToday && runsToday[i]));   // prefer an active slot that has not run yet
+          let wIdx = slots.findIndex((s, i) => isActive(s, i) && !isBlocked(i));   // prefer an active slot that has not run (or whose run failed) yet
           if (wIdx < 0) wIdx = slots.findIndex(isActive);
           let decision = "outside", go = false, curSlot = -1, chosen = -1, waitMin = 0, exact = false, target = "", targetMin = -1, fireMin = -1;
           if (wIdx >= 0) {
@@ -176,36 +242,113 @@ jobs:
             target = pad2(Math.floor(targetMin / 60)) + ":" + pad2(targetMin % 60);
             curSlot = Math.floor((now - startOf(slot)) / SLOT_MIN);
             chosen = Math.floor((targetMin - startOf(slot)) / SLOT_MIN);
-            if (runsToday && runsToday[wIdx]) decision = "done";                        // this slot already ran today
+            const failedHere = slotState(wIdx) === "failed";
+            if (isBlocked(wIdx)) decision = slotState(wIdx) === "running" ? "running" : "done";   // this slot already ran today / is running right now
+            else if (failedHere && !inWindowRetryOk(wIdx)) decision = gaveUp(wIdx) ? "gave-up" : (canRetry(wIdx) ? "next-window" : "retry-off");
             else if (now >= fireMin) {
-              if (now - fireMin < SLOT_MIN) { decision = "run"; go = true; }
-              else if (runsKnown) { decision = "catch-up"; go = true; }               // the ping that should have fired was missed
+              if (now - fireMin < SLOT_MIN && !failedHere) { decision = "run"; go = true; }
+              else if (runsKnown) { decision = failedHere ? "retry" : "catch-up"; go = true; }   // the ping that should have fired was missed / the run failed -> again inside the window
               else decision = "wait";
             }
             else if (fireMin - now < SLOT_MIN) { decision = "run"; go = true; waitMin = fireMin - now; }   // early ping -> sleep until the release minute
             else decision = "wait";
           }
+
+          // ---- v27.11: missed slots whose window is already over -------------------------------------------
+          const missed = slots.map((s, i) => i).filter(i => !(go && i === wIdx) && canRetry(i) && !isActive(slots[i], i));
+          const laterSlot = slots.findIndex((s, i) => startOf(s) > now && !isBlocked(i));      // a window still ahead today
+          let runList = go ? [wIdx] : [], plan = "";
+          if (missed.length) {
+            const room = Math.max(0, DAILY_LIMIT - uploadsDone - runList.length);
+            if (go) { runList = runList.concat(missed.slice(0, room)); plan = "merged"; }                         // upload the missed file(s) in this window's run
+            else if (laterSlot < 0) { runList = missed.slice(0, room); plan = "late"; if (runList.length) { go = true; decision = "retry-late"; } }   // nothing ahead today -> run now
+            else plan = "next-window";                                                                            // wait for the next window's run
+          }
+          const retries = runList.filter(i => markerOf(i) || i !== wIdx);
           const slotDesc = slots.map((s, i) => `S${i + 1} ${pad2(s.hour)}:${pad2(s.minute)}${s.exact ? " exact" : "-" + pad2(s.endHour) + ":" + pad2(s.endMinute) + " random"}`).join(", ");
+          const stateDesc = slots.map((s, i) => `S${i + 1}=${slotState(i)}${attemptsOf(i) > 1 ? "x" + attemptsOf(i) : ""}`).join(" ");
           console.log(`Date ${dateKey} ${hhmm} (Dhaka) | slots [${slotDesc}] (${source}) | slot ${wIdx}${wIdx >= 0 ? ` | target ${target} (${exact ? "exact" : "random in range"})` : ""} | decision: ${decision}${waitMin ? ` (sleeping ${waitMin} min until ${pad2(Math.floor(fireMin / 60)) + ":" + pad2(fireMin % 60)}${exact ? ", publish at " + target : ""})` : ""}`);
+          console.log(`Recovery: ${retryEnabled ? "on" : "off"} | uploads today ${uploadsDone}/${DAILY_LIMIT} | ${stateDesc}${missed.length ? ` | missed [${missed.map(i => "S" + (i + 1)).join(", ")}] -> ${plan}${laterSlot >= 0 && plan === "next-window" ? " (S" + (laterSlot + 1) + " " + hhmmOf(targetOf(slots[laterSlot], laterSlot)) + ")" : ""}` : ""}${runList.length ? ` | this run uploads slots [${runList.map(i => "S" + (i + 1)).join(", ")}]` : ""}`);
+
+          // ---- v27.11: tell the user once per miss (panel / app / desktop via dashboardSettings/alerts + Telegram) ----
+          const tgSend = async (html) => {
+            const tok = process.env.TELEGRAM_BOT_TOKEN, chat = process.env.TELEGRAM_CHAT_ID;
+            if (!tok || !chat) return;
+            try { await fetch(`https://api.telegram.org/bot${tok}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chat, text: html, parse_mode: "HTML", disable_web_page_preview: true }) }); } catch (e) { console.log("Telegram failed: " + e.message); }
+          };
+          const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          const pushAlert = async (id, kind, text, textBn, extra) => {
+            try { await jwrite(`dashboardSettings/alerts/${id}`, "PUT", Object.assign({ id, ts: Date.now(), kind, text, textBn: textBn || text, source: "gate", date: dateKey }, extra || {})); } catch (e) { console.log("Alert write failed: " + e.message); }
+          };
+          const pendingMarkerPatches = {};
+          const notifyMiss = async (i, mode) => {
+            const mk = markerOf(i) || {};
+            const att = attemptsOf(i);
+            const key = `a${att}-${mode}`;
+            if (mk.notified === key) return;                       // already told for this attempt/plan
+            pendingMarkerPatches[i] = Object.assign(pendingMarkerPatches[i] || {}, { notified: key });
+            if (!mk.status && markerOf(i) === null) pendingMarkerPatches[i] = Object.assign(pendingMarkerPatches[i], { status: "failed", error: "run never started", attempts: 0, at: nowMs, dhaka: hhmm });
+            const why = reasonOf(i), name = slotName(i), acc = ACCOUNT.replace(/ZEDGE(\d+)/i, "Zedge $1");
+            let how = "", howBn = "", kind = "warn";
+            if (mode === "in-window") { how = `Retrying now inside the same window (attempt ${att + 1}/${MAX_ATTEMPTS}).`; howBn = `একই উইন্ডোর মধ্যেই এখন আবার চেষ্টা হচ্ছে (চেষ্টা ${att + 1}/${MAX_ATTEMPTS})।`; }
+            else if (mode === "merged") { how = `Uploading it now together with ${slotName(wIdx)} - this run uploads 2 files.`; howBn = `${slotName(wIdx)} এর সাথে এখনই আপলোড হচ্ছে - এই রানে ২টি ফাইল যাবে।`; }
+            else if (mode === "next-window") { how = `It will be uploaded in the next window - ${slotName(laterSlot)} - together with that slot's file.`; howBn = `পরের উইন্ডোতে (${slotName(laterSlot)}) ওই স্লটের ফাইলের সাথে আপলোড হয়ে যাবে।`; }
+            else if (mode === "late") { how = "No window is left today - uploading it now (late catch-up)."; howBn = "আজ আর কোনো উইন্ডো বাকি নেই - এখনই আপলোড হচ্ছে (late catch-up)।"; }
+            else if (mode === "gave-up") { kind = "err"; how = `Gave up after ${MAX_ATTEMPTS} attempts - check the GitHub Actions log / queue and use force run if needed.`; howBn = `${MAX_ATTEMPTS} বার চেষ্টার পরেও হয়নি - GitHub Actions লগ / কিউ চেক করুন, দরকার হলে force run দিন।`; }
+            else if (mode === "limit") { kind = "info"; how = "Today's 3 uploads are already done, so nothing is missing."; howBn = "আজকের ৩টি আপলোড এমনিতেই হয়ে গেছে, কিছু বাদ পড়েনি।"; }
+            const text = `${name} was not uploaded at its scheduled time: ${why}. ${how}`;
+            const textBn = `${name} নির্ধারিত সময়ে আপলোড হয়নি: ${why}. ${howBn}`;
+            await pushAlert(`${dateKey}-s${i}-${key}`, kind, text, textBn, { slot: i, attempts: att, plan: mode, account: acc });
+            await tgSend([`${kind === "err" ? "🚨" : "⚠️"} <b>স্লট মিস - ${esc(name)}</b>`, "━━━━━━━━━━━━━━━━", `📁 প্রজেক্ট: ${esc(acc)}`, `📝 কারণ: <code>${esc(why)}</code>`, `🔁 পরবর্তী: ${esc(howBn)}`, `🕒 সময়: ${dateKey} ${hhmm} (Dhaka)`].join("\n"));
+          };
+          try {
+            if (go && decision === "retry") await notifyMiss(wIdx, "in-window");
+            for (const i of missed) await notifyMiss(i, plan === "merged" && runList.includes(i) ? "merged" : plan === "late" && runList.includes(i) ? "late" : plan === "next-window" ? "next-window" : (uploadsDone >= DAILY_LIMIT ? "limit" : "next-window"));
+            for (let i = 0; i < slots.length; i++) if (gaveUp(i) && !(go && runList.includes(i))) await notifyMiss(i, "gave-up");
+            if (Object.keys(pendingMarkerPatches).length) {
+              const cur = (await jget(`dashboardSettings/gate/runs/${dateKey}`)) || {};
+              for (const i of Object.keys(pendingMarkerPatches)) cur[i] = Object.assign({}, cur[i] || {}, pendingMarkerPatches[i]);
+              await jwrite("dashboardSettings/gate/runs", "PUT", { [dateKey]: cur });
+              runsToday = cur;
+            }
+            // keep the alert list small (last 3 days)
+            const al = (await jget("dashboardSettings/alerts")) || {};
+            const cutoff = nowMs - 3 * 86400000;
+            for (const k of Object.keys(al)) if (al[k] && Number(al[k].ts || 0) < cutoff) await jwrite(`dashboardSettings/alerts/${k}`, "DELETE", null).catch(() => {});
+          } catch (e) { console.log("Recovery bookkeeping failed: " + e.message); }
 
           try {
-            await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, slotsUsed: slots, windowsSource: source, lastRunId: RUN_ID, lastMode: wIdx >= 0 ? (exact ? "exact" : "random") : null });
+            await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, slotsUsed: slots, windowsSource: source, lastRunId: RUN_ID, lastMode: wIdx >= 0 ? (exact ? "exact" : "random") : null, recovery: { enabled: retryEnabled, uploadsDone, missed, plan: plan || null, nextSlot: laterSlot, states: slots.map((s, i) => slotState(i)), at: Date.now() } });
           } catch (e) { console.log("Health log failed: " + e.message); }
 
           if (go) {
             try {
               const all = (await jget("dashboardSettings/gate/runs")) || {};
               const today = Object.assign({}, all[dateKey] || {});
-              today[wIdx] = { at: Date.now() + waitMin * 60000, dhaka: exact ? target : (waitMin ? target : hhmm), slot: curSlot, chosen, exact, target, lead: exact ? EXACT_LEAD_MIN : 0, catchUp: decision === "catch-up", runId: RUN_ID };
+              for (const idx of runList) {
+                const prev = (today[idx] && typeof today[idx] === "object") ? today[idx] : null;
+                const isMain = idx === wIdx && decision !== "retry-late";
+                today[idx] = Object.assign({}, prev || {}, {
+                  at: Date.now() + waitMin * 60000, dhaka: isMain ? (exact ? target : (waitMin ? target : hhmm)) : hhmm, slot: isMain ? curSlot : -1, chosen: isMain ? chosen : -1,
+                  exact: isMain ? exact : false, target: isMain ? target : hhmmOf(targetOf(slots[idx], idx)), lead: isMain && exact ? EXACT_LEAD_MIN : 0,
+                  catchUp: isMain ? decision === "catch-up" : true, runId: RUN_ID,
+                  // v27.11 result tracking - bot.js / the workflow flip status to uploaded | failed | idle | skipped-limit
+                  status: "started", attempts: (prev ? attemptsOf(idx) : 0) + 1, retry: !!prev || !isMain, plan: isMain ? (decision === "retry" ? "in-window" : null) : plan,
+                  prevError: prev && prev.error ? String(prev.error).slice(0, 200) : null, error: null, finishedAt: null
+                });
+              }
               await jwrite("dashboardSettings/gate/runs", "PUT", { [dateKey]: today });   // keeps only today
-              await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now() + waitMin * 60000, lastRunDhaka: `${dateKey} ${waitMin ? target : hhmm}`, lastRunWindow: wIdx });
+              await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now() + waitMin * 60000, lastRunDhaka: `${dateKey} ${waitMin ? target : hhmm}`, lastRunWindow: wIdx, lastRunSlots: runList });
             } catch (e) { console.log("Run marker failed: " + e.message); }
             if (waitMin > 0) {
               console.log(exact ? `Waiting ${waitMin} min - releasing ${EXACT_LEAD_MIN} min early so the Publish click lands at ${target} Dhaka sharp...` : `Waiting ${waitMin} min so the upload starts at ${target} Dhaka...`);
               await new Promise(r => setTimeout(r, waitMin * 60 * 1000));
             }
-            if (exact) setOutput("target", target);   // v26.2: bot.js holds Publish until this HH:MM (Dhaka)
+            if (exact && decision !== "retry-late") setOutput("target", target);   // v26.2: bot.js holds Publish until this HH:MM (Dhaka)
             setOutput("exact", "yes");   // v23.1: gate already picked the minute -> skip the extra random delay in both modes
+            setOutput("slots", JSON.stringify(runList));
+            setOutput("count", String(Math.max(1, runList.length)));
+            setOutput("retries", JSON.stringify(retries));
           }
           process.exit(go ? 0 : 2);
           GATE_EOF
@@ -216,6 +359,9 @@ jobs:
     # v24: normal run needs the gate's OK; a vpn_test run bypasses the gate and only executes the VPN steps
     if: ${{ !cancelled() && ((needs.gate.result == 'success' && needs.gate.outputs.go == 'yes') || inputs.run_mode == 'vpn_test') }}
     runs-on: ${{ inputs.os }}
+    # v27.11.2: safety net - a run can never sit "in progress" for hours. Random delay (<=14 min) + VPN (<=15 min) +
+    # setup (~5 min) + up to 2 uploads fit easily; if it is exceeded the slot is reported as failed and retried.
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -1003,6 +1149,41 @@ jobs:
           // until HH:MM (Asia/Dhaka) sharp. Only the first publish of the run is held.
           const EXACT_TARGET = (process.env.EXACT_TARGET_DHAKA || "").trim();
           let exactHoldUsed = false;
+
+          // v27.11 MISSED-SLOT RECOVERY (bot.js side): the gate tells us which schedule slot(s) this run serves
+          // (GATE_SLOTS, e.g. [1] or [2,1] when a missed slot is merged into this window) and we report the REAL
+          // result of every upload into that slot's run marker (dashboardSettings/gate/runs/<date>/<slot>.status):
+          //   started (gate) -> uploaded | failed | idle | skipped-limit. The gate retries anything that is not
+          //   "uploaded"/"skipped-limit", so a file that was never added / never had its Upload button clicked is
+          //   uploaded again in the same window, the next window, or as a late catch-up - never silently lost.
+          const GATE_SLOTS = (() => { try { const a = JSON.parse(process.env.GATE_SLOTS || "[]"); return Array.isArray(a) ? a.map(Number).filter(Number.isInteger) : []; } catch (_) { return []; } })();
+          const GATE_RETRY_SLOTS = (() => { try { const a = JSON.parse(process.env.GATE_RETRY_SLOTS || "[]"); return Array.isArray(a) ? a.map(Number).filter(Number.isInteger) : []; } catch (_) { return []; } })();
+          const GATE_DATE_KEY = new Date(Date.now() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+          const gateSlotDone = new Set();
+          const gateSlotFor = (uploadIdx) => GATE_SLOTS[uploadIdx] !== undefined ? GATE_SLOTS[uploadIdx] : GATE_SLOTS[0];
+          async function markGateSlot(uploadIdx, patch) {
+            const slot = gateSlotFor(uploadIdx);
+            if (slot === undefined) return;                       // force run / manual run - no gate slot to report to
+            if (patch && patch.status && patch.status !== "started") gateSlotDone.add(slot);
+            try {
+              await firebasePatch(`dashboardSettings/gate/runs/${GATE_DATE_KEY}/${slot}`, Object.assign({ finishedAt: Date.now(), runId: process.env.GITHUB_RUN_ID || "" }, patch));
+              console.log(`GATE_SLOT => S${slot + 1} ${patch.status}${patch.error ? " (" + patch.error + ")" : ""}`);
+            } catch (e) { console.log(`gate slot report failed (${e.message})`); }
+          }
+          async function markRemainingGateSlots(fromIdx, patch) {
+            for (let k = Math.max(0, fromIdx); k < Math.max(1, GATE_SLOTS.length); k++) {
+              const slot = gateSlotFor(k);
+              if (slot === undefined || gateSlotDone.has(slot)) continue;
+              await markGateSlot(k, patch);
+            }
+          }
+          async function pushPanelAlert(kind, text, textBn, extra) {
+            try {
+              const id = `${GATE_DATE_KEY}-bot-${Date.now().toString(36)}`;
+              const res = await fetch(`${firebaseDatabaseURL}/dashboardSettings/alerts/${id}.json`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ id, ts: Date.now(), kind, text, textBn: textBn || text, source: "bot", date: GATE_DATE_KEY }, extra || {})) });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            } catch (e) { console.log(`panel alert failed (${e.message})`); }
+          }
           async function waitForExactTarget(stage) {
             if (exactHoldUsed || !/^\d{2}:\d{2}$/.test(EXACT_TARGET)) return;
             exactHoldUsed = true;
@@ -1288,6 +1469,7 @@ jobs:
             const ZEDGE_DAILY_LIMIT = 3; // Zedge max uploads per day
             if (state.totalUploadsToday >= ZEDGE_DAILY_LIMIT) {
               console.log(`🛑 Zedge daily limit of ${ZEDGE_DAILY_LIMIT} uploads reached. Exiting safely.`);
+              await markRemainingGateSlots(0, { status: "skipped-limit", error: "daily limit of 3 uploads already reached" });   // v27.11: nothing is missing -> no retry
               process.exit(0); 
             }
 
@@ -1497,14 +1679,25 @@ jobs:
               let chosen = null;
               const empty = [];
               for (const t of seq) { const found = entriesOfType(t); if (found.length) { chosen = { t, found }; break; } empty.push(t); }
+              // v27.11 GAP FILL: the type(s) this slot wanted have no stock (e.g. only 2 content types have files
+              // but the day has 3 slots) -> NEVER leave the slot blank. Take the type with the FEWEST uploads today
+              // that still has stock (least-repeated first, then today's order). Applies in strict mode too: strict
+              // now only sets the preference (different type first) - an empty slot is worse than a repeated type,
+              // 3 slots must always mean 3 uploads.
+              let gapFill = false;
+              if (!chosen) {
+                const cnt = (t) => used.filter(u => u === t).length;
+                const ranked = variety.order.slice().sort((a, b) => cnt(a) - cnt(b) || variety.order.indexOf(a) - variety.order.indexOf(b));
+                for (const t of ranked) { const found = entriesOfType(t); if (found.length) { chosen = { t, found }; gapFill = true; break; } }
+              }
               if (!chosen) {
                 const metaNote = missingMeta.length ? ` NO_METADATA => ${missingMeta.length} file(s) are waiting for metadata and were not counted.` : "";
-                throw new Error(`MIX_MODE_WAIT => mix mode is ON and no queued file exists for any ${variety.strict ? "unused " : ""}type today (used today: [${used.join(", ") || "none"}], empty: [${empty.join(", ")}]). Add files of another type or pin an item.${metaNote}`);
+                throw new Error(`MIX_MODE_WAIT => mix mode is ON and no queued file exists for ANY content type today (used today: [${used.join(", ") || "none"}], empty: [${empty.join(", ")}]). Add files or pin an item.${metaNote}`);
               }
               pickedType = chosen.t;
               entries = chosen.found;
               varietyPick = chosen.t;
-              console.log(`MIX_MODE => slot ${used.length + 1}: uploading ${chosen.t} (${chosen.found.length} queued). Used today: [${used.join(", ") || "none"}] | order today: ${variety.order.join(" > ")}${empty.length ? ` | skipped (empty): ${empty.join(", ")}` : ""}`);
+              console.log(`MIX_MODE => slot ${used.length + 1}: uploading ${chosen.t} (${chosen.found.length} queued)${gapFill ? " [GAP FILL - wanted type(s) " + (empty.join(", ") || "-") + " have no stock, repeating the least-used type so the slot is not left empty]" : ""}. Used today: [${used.join(", ") || "none"}] | order today: ${variety.order.join(" > ")}${empty.length && !gapFill ? ` | skipped (empty): ${empty.join(", ")}` : ""}`);
             }
             if (varietyPick) {
               // handled above - day-type rotation / lock rules do not apply in mix mode
@@ -2186,13 +2379,14 @@ jobs:
               .locator('[role="dialog"] button:has-text("Edit meta")')
               .first();
 
-            await editMetaButton.waitFor({ state: "visible" });
+            // v27.11.2: bounded waits (10 min) - a stuck Zedge upload/processing no longer hangs the run forever
+            await editMetaButton.waitFor({ state: "visible", timeout: 10 * 60 * 1000 });
 
             await page.waitForFunction(() => {
               const buttons = [...document.querySelectorAll("button")];
               const editMeta = buttons.find(btn => btn.textContent.trim() === "Edit meta");
               return editMeta && editMeta.disabled === false;
-            });
+            }, null, { timeout: 10 * 60 * 1000 });
 
             await scrollToElement(editMetaButton);
             await editMetaButton.click();
@@ -2648,8 +2842,11 @@ jobs:
               const profileStateData = await getProfileState(TOTAL_PROFILES);
               // 3 runs per day (morning / noon / evening) - upload only 1 item per run.
               // Daily cap of ZEDGE_DAILY_LIMIT (3) is still enforced across all runs of the day.
-              const UPLOADS_PER_RUN = 1;
+              // v27.11: the gate raises this to 2 when a MISSED slot is merged into this window's run (UPLOADS_PER_RUN env);
+              // the daily cap below still guarantees never more than 3 uploads a day.
+              const UPLOADS_PER_RUN = Math.max(1, Math.min(ZEDGE_DAILY_LIMIT, parseInt(process.env.UPLOADS_PER_RUN || "1", 10) || 1));
               const remainingUploads = Math.min(UPLOADS_PER_RUN, ZEDGE_DAILY_LIMIT - profileStateData.state.totalUploadsToday);
+              if (GATE_SLOTS.length) console.log(`GATE_SLOTS => this run serves schedule slot(s) [${GATE_SLOTS.map(s => "S" + (s + 1)).join(", ")}]${GATE_RETRY_SLOTS.length ? " | retry of [" + GATE_RETRY_SLOTS.map(s => "S" + (s + 1)).join(", ") + "]" : ""} | uploads this run: ${remainingUploads}`);
               let currentProfileIndex = profileStateData.nextProfileIndex;
               let perProfileLimit     = profileStateData.perProfileLimit;
               let currentState = profileStateData.state;
@@ -3088,6 +3285,23 @@ jobs:
                 console.log("Attempting to proceed with login anyway...");
               }
 
+              // v27.11.4: network-level login confirmation (from HAR of a logged-in session). Right after a successful
+              // login the SPA calls POST /auth/token -> {accessToken, expiresAt} and GET /auth/user-info?scope=user ->
+              // {email, username, expiresAt}. Both are cookie-session based, so we listen for them AND poll user-info
+              // ourselves from inside the page - this works even when the dashboard / bell icon renders late or not at all.
+              const loginNet = { via: null, email: null, username: null };
+              page.on("response", (res) => {
+                try {
+                  const u = res.url();
+                  if (res.status() !== 200) return;
+                  if (u.indexOf("upload.zedge.net/auth/user-info") >= 0) {
+                    res.json().then((j) => { if (j && j.email) { loginNet.via = "network:/auth/user-info"; loginNet.email = j.email; loginNet.username = j.username || null; } }).catch(() => {});
+                  } else if (u.indexOf("upload.zedge.net/auth/token") >= 0) {
+                    res.json().then((j) => { if (j && j.accessToken) { if (!loginNet.via) loginNet.via = "network:/auth/token"; } }).catch(() => {});
+                  }
+                } catch (_) {}
+              });
+
               await safeClickWithPopupRecovery(
                 page,
                 page.locator('[data-hook="za-login-email"]').first(),
@@ -3118,8 +3332,62 @@ jobs:
                 "Login"
               );
 
-              console.log("Waiting for login success bell icon");
-              await page.locator('svg[data-icon="bell"]').waitFor({ state: "visible" });
+              console.log("Waiting for login success (auth/user-info API + dashboard / profiles / bell icon)");
+              // v27.11.3/v27.11.4: the bell icon alone is NOT a reliable login signal. Login is confirmed by (in order):
+              //   1. network: GET /auth/user-info?scope=user answered 200 with {email} (or POST /auth/token with accessToken)
+              //   2. active probe: fetch("/auth/user-info?scope=user") from inside the page with the session cookie -> {email}
+              //   3. DOM: "Dashboard" + input[name="period"], UNLOCKS/USERS/NET REVENUE cards, "All profiles" filter,
+              //      Profiles nav link, /profiles URL, bell icon
+              // A visible login error (wrong password, captcha, locked) fails fast instead of waiting 4 minutes.
+              const loginSuccessSignal = () => {
+                const vis = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const txt = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+                const all = (sel) => Array.from(document.querySelectorAll(sel));
+                const has = (sel, t) => all(sel).some((el) => vis(el) && (t ? txt(el).toUpperCase() === t : true));
+                const body = ((document.body && document.body.innerText) || "").replace(/\s+/g, " ");
+                const loginFormOpen = has('[data-hook="form-field-password-input"]') || has('[data-hook="form-field-email-input"]') || has('[data-hook="za-login-email"]');
+                if (has('input[name="period"]') && /\bDashboard\b/.test(body)) return "dom:dashboard-period-picker";
+                if (has("span", "NET REVENUE") || has("span", "UNLOCKS") || has("span", "USERS")) return "dom:dashboard-revenue-cards";
+                if (has('input[name="profiles"]') || /\bAll profiles\b/.test(body)) return "dom:dashboard-profiles-filter";
+                if (has('svg[data-icon="bell"]')) return "dom:bell-icon";
+                if (!loginFormOpen && all('a[href*="/profiles"]').some(vis)) return "dom:profiles-nav-link";
+                if (!loginFormOpen && /\/profiles(\/|$)/.test(location.pathname)) return "dom:profiles-url";
+                const err = body.match(/(invalid (email|password|credentials)|incorrect (email|password)|wrong password|password (is|was) (incorrect|invalid)|account (is |has been )?(locked|disabled|suspended)|too many attempts|verify your email|captcha)/i);
+                if (err && loginFormOpen) return "ERROR:" + err[0];
+                return false;
+              };
+              // Probe runs inside the page so the httpOnly session cookie is sent automatically.
+              const probeUserInfo = () => fetch("/auth/user-info?scope=user", { credentials: "include", cache: "no-store", headers: { "content-type": "application/json" } })
+                .then((r) => (r.ok ? r.json().then((j) => ({ status: r.status, email: j && j.email || null, username: j && j.username || null })) : { status: r.status, email: null }))
+                .catch((e) => ({ status: 0, email: null, err: String(e && e.message || e) }));
+              let loginSignal = null;
+              let loginUser = null;
+              const loginDeadline = Date.now() + 4 * 60 * 1000;
+              let loginProbes = 0;
+              while (!loginSignal && Date.now() < loginDeadline) {
+                if (loginNet.via && (loginNet.email || loginNet.via === "network:/auth/token")) {
+                  loginSignal = loginNet.via; loginUser = loginNet.email;
+                  if (!loginUser) { const p = await page.evaluate(probeUserInfo).catch(() => null); if (p && p.email) { loginUser = p.email; loginSignal = "network:/auth/token+probe"; } }
+                  break;
+                }
+                const probe = await page.evaluate(probeUserInfo).catch(() => null);
+                loginProbes++;
+                if (probe && probe.email) { loginSignal = "api:/auth/user-info"; loginUser = probe.email; break; }
+                const dom = await page.evaluate(loginSuccessSignal).catch(() => false);
+                if (dom) { loginSignal = dom; break; }
+                if (loginProbes % 10 === 1) console.log("  ...still waiting for login (user-info status " + (probe ? probe.status : "n/a") + ", url " + page.url() + ")");
+                await page.waitForTimeout(2000);
+              }
+              if (!loginSignal) {
+                await page.screenshot({ path: "zedge-login-stuck.png", fullPage: true }).catch(() => {});
+                const bodyText = await page.evaluate(() => (document.body && document.body.innerText || "").slice(0, 400)).catch(() => "");
+                throw new Error("LOGIN_STUCK => Zedge did not confirm login within 4 min (no /auth/user-info session, no dashboard). Possible captcha / verification / wrong password / site slow. URL: " + page.url() + (bodyText ? " | page: " + bodyText.replace(/\s+/g, " ").slice(0, 300) : ""));
+              }
+              if (typeof loginSignal === "string" && loginSignal.indexOf("ERROR:") === 0) {
+                await page.screenshot({ path: "zedge-login-stuck.png", fullPage: true }).catch(() => {});
+                throw new Error("LOGIN_FAILED => Zedge showed a login error: \"" + loginSignal.slice(6) + "\" (check ZEDGE_EMAIL / ZEDGE_PASSWORD secrets). URL: " + page.url());
+              }
+              console.log("✅ Login success detected via: " + loginSignal + (loginUser ? " (account " + loginUser + ")" : ""));
               await page.screenshot({ path: "zedge-after-login.png", fullPage: true });
 
               // ─────────────────────────────────────────────────────────────
@@ -3206,6 +3474,8 @@ jobs:
                     );
                     await sendTelegramNotification(idleMsg);
                   }
+                  // v27.11: report the slot(s) this run could not fill so the gate retries them (if files get added later)
+                  await markRemainingGateSlots(i, { status: "idle", error: String(reason).replace(/\s+/g, " ").slice(0, 200) });
                   break;
                 }
 
@@ -3352,6 +3622,13 @@ jobs:
 
                   successCount++;
 
+                  // v27.11: confirm the REAL upload to the gate (this is what "slot done" means from now on)
+                  await markGateSlot(i, { status: "uploaded", itemId: queueItem.id || null, title: String(queueItem.title || queueItem.name || "").slice(0, 120), contentType: queueItem.contentType || (queueItem.isMp3 ? "RINGTONE" : "WALLPAPER"), publish: (publishResult && publishResult.statusName) || null, uploadedDhaka: fmtDhakaTime() });
+                  if (GATE_RETRY_SLOTS.includes(gateSlotFor(i))) {
+                    const sN = gateSlotFor(i) + 1, t = String(queueItem.title || queueItem.name || "file").slice(0, 80);
+                    await pushPanelAlert("ok", `Slot ${sN} recovered: "${t}" was uploaded at ${fmtDhakaTime()} (retry).`, `স্লট ${sN} রিকভার হয়েছে: "${t}" ${fmtDhakaTime()} এ আপলোড হয়ে গেছে (retry)।`, { slot: sN - 1, itemId: queueItem.id || null });
+                  }
+
                   const fileTypeLabel = ctypeLabel(queueItem);
                   const greeting = getDhakaGreeting();
                   const statusLine = `<b>${STATUS_UI[publishResult.statusName] || tgEscape(publishResult.statusName)}</b>`;
@@ -3410,6 +3687,7 @@ jobs:
                   console.log("Continuing to next upload despite error...");
                   // Notify user of upload failure
                   failedCount++;
+                  await markGateSlot(i, { status: "failed", error: String(uploadErr.message || "technical error").replace(/\s+/g, " ").slice(0, 200) });   // v27.11 -> gate retries this slot
                   try {
                     const errSnippet = tgEscape(String(uploadErr.message || "Unknown error").slice(0, 160));
                     const uploadErrMsg = tgCard(
@@ -3438,6 +3716,7 @@ jobs:
                 currentProfileIndex = getNextAvailableProfile(currentProfileIndex, currentState.profileUploadCounts, TOTAL_PROFILES, perProfileLimit);
                 if (currentProfileIndex === -1) {
                   console.log("All profiles have uploaded today. No further uploads this run.");
+                  await markRemainingGateSlots(i + 1, { status: "skipped-limit", error: "all profiles reached their daily limit" });   // v27.11
                   break;
                 }
 
@@ -3501,6 +3780,8 @@ jobs:
 
             } catch (err) {
               console.error("BOT FATAL ERROR:", err);
+              // v27.11: every slot this run had not finished is reported as failed -> the gate retries it
+              await markRemainingGateSlots(0, { status: "failed", error: ("fatal: " + String((err && err.message) || err || "unknown")).replace(/\s+/g, " ").slice(0, 200) }).catch(() => {});
               // Notify user of fatal crash before exiting
               try {
                 const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
@@ -3565,8 +3846,41 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
           FOLDER_NAME: "Zedge 3"
           EXACT_TARGET_DHAKA: ${{ needs.gate.outputs.target }}   # v26.2: gate released early, hold Publish until this minute
+          # v27.11 missed-slot recovery: slot(s) served by this run + how many uploads (2 when a missed slot is merged in)
+          GATE_SLOTS: ${{ needs.gate.outputs.slots }}
+          GATE_RETRY_SLOTS: ${{ needs.gate.outputs.retries }}
+          UPLOADS_PER_RUN: ${{ needs.gate.outputs.count || '1' }}
 
         run: node bot.js
+
+      - name: 🛟 Report unfinished slot(s) to the gate (job failed / cancelled before the upload)
+        # v27.11: if the job died before bot.js could report (checkout / npm / Playwright / VPN step error, runner
+        # killed, cancelled) the slot marker would stay "started" forever. Flip it to "failed" right away so the
+        # gate retries the slot on the next ping instead of waiting for the 70 min stale timeout.
+        if: inputs.run_mode != 'vpn_test' && (failure() || cancelled())
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GATE_SLOTS: ${{ needs.gate.outputs.slots }}
+          FIREBASE_DB_URL: "https://zedge3-1b3dc-default-rtdb.firebaseio.com"
+        run: |
+          @'
+          const DB = process.env.FIREBASE_DB_URL;
+          let slots = []; try { slots = JSON.parse(process.env.GATE_SLOTS || "[]"); } catch (_) {}
+          const dateKey = new Date(Date.now() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+          (async () => {
+            for (const s of slots) {
+              try {
+                const r = await fetch(`${DB}/dashboardSettings/gate/runs/${dateKey}/${s}.json`);
+                const m = r.ok ? await r.json() : null;
+                if (!m || m.status !== "started") { console.log(`slot ${s}: status ${m && m.status} - nothing to do`); continue; }
+                await fetch(`${DB}/dashboardSettings/gate/runs/${dateKey}/${s}.json`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "failed", error: "workflow job failed / was cancelled before the upload finished (see GitHub Actions log)", finishedAt: Date.now(), runId: process.env.GITHUB_RUN_ID || "" }) });
+                console.log(`slot ${s} -> failed (gate will retry)`);
+              } catch (e) { console.log(`slot ${s}: ${e.message}`); }
+            }
+          })();
+          '@ | Set-Content gate-report.mjs
+          node gate-report.mjs
 
       - name: 🔐 VPN disconnect
         if: always()
