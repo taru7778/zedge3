@@ -90,6 +90,7 @@ jobs:
         env:
           # v28 security: database URL comes from GitHub Secrets (GitHub > Settings > Secrets and variables > Actions)
           FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
           # v27.11: the gate reports a missed slot to Telegram as well (same bot / chat as the upload reports)
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -1092,6 +1093,7 @@ jobs:
         timeout-minutes: 15
         env:
           FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
           ACCOUNT_LABEL: "Zedge 3"
           RUN_MODE: ${{ inputs.run_mode }}
           VPN_PROFILE: ${{ inputs.vpn_profile }}
@@ -1121,7 +1123,9 @@ jobs:
           const firebaseDatabaseURL = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
           if (!firebaseDatabaseURL) throw new Error("GitHub secret ZEDGE3_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions");
           const queuePath = "wallpaperQueue";
-          const r2WorkerUrl = "https://tarek.henrydelacruz0t7.workers.dev"; // <-- CONFIG: your Cloudflare R2 worker URL
+          // v28 security: R2 worker URL comes from the GitHub secret R2_WORKER_URL
+          const r2WorkerUrl = (process.env.R2_WORKER_URL || "").trim().replace(/\/+$/, "");
+          if (!r2WorkerUrl) throw new Error("GitHub secret R2_WORKER_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions");
 
           if (!zedgeEmail) throw new Error("Zedge email is required");
           if (!zedgePassword) throw new Error("Zedge password is required");
@@ -3869,6 +3873,7 @@ jobs:
         env:
           GATE_SLOTS: ${{ needs.gate.outputs.slots }}
           FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
         run: |
           @'
           const DB = process.env.FIREBASE_DB_URL;
