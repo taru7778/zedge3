@@ -88,9 +88,11 @@ jobs:
         id: decide
         shell: bash
         env:
+          # v28 security: database URL comes from GitHub Secrets (GitHub > Settings > Secrets and variables > Actions)
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
           # v27.11: the gate reports a missed slot to Telegram as well (same bot / chat as the upload reports)
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # v27.11.1: passed via env - a `${{ }}` inside this big run block made GitHub reject the workflow
           # ("Exceeded max expression length 21000"); env values are not subject to that limit.
           FORCE_RUN: ${{ inputs.force_run }}
@@ -114,7 +116,8 @@ jobs:
           //   exact=true  -> upload starts at HH:MM sharp (the gate sleeps until that minute if the ping came early;
           //                  a missed ping is caught up on the next ping within the same 3 h window).
           // Falls back to DEFAULT_WINDOWS if Firebase is unreachable. Health + run markers -> dashboardSettings/gate.
-          const DB = "https://zedge3-1b3dc-default-rtdb.firebaseio.com";
+          const DB = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
+          if (!DB) { console.log("::error::GitHub secret ZEDGE3_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions"); process.exit(1); }
           const ACCOUNT = "ZEDGE3";
           const DEFAULT_WINDOWS = [5, 11, 17];   // window start hours (Asia/Dhaka) - fallback only
           const WINDOW_HOURS = 3;                      // each window lasts 3 hours
@@ -1088,12 +1091,12 @@ jobs:
         shell: pwsh
         timeout-minutes: 15
         env:
-          FIREBASE_DB_URL: "https://zedge3-1b3dc-default-rtdb.firebaseio.com"
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
           ACCOUNT_LABEL: "Zedge 3"
           RUN_MODE: ${{ inputs.run_mode }}
           VPN_PROFILE: ${{ inputs.vpn_profile }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if ($env:RUN_MODE -eq 'vpn_test') { node vpn.mjs test } else { node vpn.mjs connect }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1114,7 +1117,9 @@ jobs:
           const zedgePassword = process.env.ZEDGE_PASSWORD;
           const isHeadless = process.env.HEADLESS === "true";
 
-          const firebaseDatabaseURL = "https://zedge3-1b3dc-default-rtdb.firebaseio.com"; // <-- CONFIG: your Firebase Realtime Database URL for account 3
+          // v28 security: database URL comes from the GitHub secret ZEDGE3_DB_URL (env FIREBASE_DB_URL)
+          const firebaseDatabaseURL = (process.env.FIREBASE_DB_URL || "").trim().replace(/\/+$/, "");
+          if (!firebaseDatabaseURL) throw new Error("GitHub secret ZEDGE3_DB_URL is missing - set it in GitHub > Settings > Secrets and variables > Actions");
           const queuePath = "wallpaperQueue";
           const r2WorkerUrl = "https://tarek.henrydelacruz0t7.workers.dev"; // <-- CONFIG: your Cloudflare R2 worker URL
 
@@ -3836,14 +3841,15 @@ jobs:
           PROXY_SERVER: ${{ github.event.inputs.proxy_server }}
           PROXY_USER: ${{ github.event.inputs.proxy_user }}
           PROXY_PASS: ${{ github.event.inputs.proxy_pass }}
-          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email }}
-          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password }}
+          # v28: login from the dispatch inputs, or (safer) from the GitHub secrets ZEDGE3_EMAIL / ZEDGE3_PASSWORD
+          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email || secrets.ZEDGE3_EMAIL }}
+          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password || secrets.ZEDGE3_PASSWORD }}
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
           # Telegram reports go to Tarek bhai's bot by default; repository secrets override if set
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '8899129457:AAERgs5UOqx-cWR8RMOPVpDwqbvb0ixcJ38' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '8998798162' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FOLDER_NAME: "Zedge 3"
           EXACT_TARGET_DHAKA: ${{ needs.gate.outputs.target }}   # v26.2: gate released early, hold Publish until this minute
           # v27.11 missed-slot recovery: slot(s) served by this run + how many uploads (2 when a missed slot is merged in)
@@ -3862,7 +3868,7 @@ jobs:
         shell: pwsh
         env:
           GATE_SLOTS: ${{ needs.gate.outputs.slots }}
-          FIREBASE_DB_URL: "https://zedge3-1b3dc-default-rtdb.firebaseio.com"
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
         run: |
           @'
           const DB = process.env.FIREBASE_DB_URL;
