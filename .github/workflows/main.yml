@@ -3848,6 +3848,9 @@ jobs:
           # v28: login from the dispatch inputs, or (safer) from the GitHub secrets ZEDGE3_EMAIL / ZEDGE3_PASSWORD
           ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email || secrets.ZEDGE3_EMAIL }}
           ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password || secrets.ZEDGE3_PASSWORD }}
+          # v28 security: from GitHub Secrets (needed by bot.js)
+          FIREBASE_DB_URL: ${{ secrets.ZEDGE3_DB_URL }}
+          R2_WORKER_URL: ${{ secrets.R2_WORKER_URL }}
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
