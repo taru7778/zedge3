@@ -1793,6 +1793,7 @@ jobs:
             let localFiles = [];
             let fileUrls = [];
             let localThumb = null;
+            let localLandscape = null;   // v27.14: landscape/foldable companion image
 
             if (SET_SLOTS[contentType]) {
               // Multi-image set (24H / Dual / Battery) - download every slot image in order
@@ -1845,6 +1846,19 @@ jobs:
               if (item.fileUrl) fileUrls = [item.fileUrl];
             }
 
+            // v27.14 LANDSCAPE / FOLDABLE: optional 2000x2000 companion image uploaded
+            // inside the meta dialog, right before Publish (any image content type).
+            if (item.landscapeUrl && !isMp3) {
+              try {
+                localLandscape = path.join(localDir, `${id}-landscape.jpg`);
+                await downloadToFile(item.landscapeUrl, localLandscape, "landscape/foldable wallpaper");
+                fileUrls.push(item.landscapeUrl);
+              } catch (e) {
+                localLandscape = null;
+                console.warn(`Landscape/foldable image download failed (continuing without it): ${e.message}`);
+              }
+            }
+
             // Item already claimed above (anti double-upload guard) - no re-claim needed.
 
             return {
@@ -1852,6 +1866,7 @@ jobs:
               localFile,
               localFiles,
               localThumb,
+              localLandscape,
               contentType,
               isMp3,
               dayTypeSwitchedTo,
@@ -2453,6 +2468,56 @@ jobs:
                 await page.waitForTimeout(1000);
               } catch (e) {
                 console.warn(`Cover image upload issue (continuing): ${e.message}`);
+              }
+            }
+
+            // ── LANDSCAPE / FOLDABLE WALLPAPER (v27.14) ──
+            // Zedge added "Add landscape/foldable wallpaper" to the meta step. Same modal
+            // shape as the cover image: file input + 2 consent checkboxes + Upload.
+            if (meta.landscapeImage) {
+              try {
+                console.log("Uploading landscape/foldable wallpaper");
+                const addLandscape = page
+                  .locator('a:has-text("Add landscape/foldable wallpaper"), a:has-text("Add landscape")')
+                  .first();
+                await addLandscape.waitFor({ state: "visible", timeout: 15000 });
+                await scrollToElement(addLandscape);
+                await addLandscape.click();
+                console.log("Clicked Add landscape/foldable wallpaper");
+
+                const lsDialog = page.locator('[role="dialog"]').filter({ hasText: "landscape/foldable wallpaper" }).first();
+                await lsDialog.waitFor({ state: "visible", timeout: 15000 });
+
+                const lsInput = lsDialog.locator('input[data-hook="form-field-files-input"]').first();
+                await lsInput.waitFor({ state: "attached" });
+                await lsInput.setInputFiles(meta.landscapeImage);
+                console.log("Landscape file set");
+                await page.waitForTimeout(800);
+
+                for (const hook of ["form-field-accept-input", "form-field-acceptContentPolicy-input"]) {
+                  const cb = lsDialog.locator(`[data-hook="${hook}"]`).first();
+                  if (await cb.count()) {
+                    await cb.click({ force: true });
+                    await page.waitForTimeout(300);
+                  }
+                }
+
+                const lsSubmit = lsDialog.locator('button[type="submit"]:has-text("Upload")').first();
+                await page.waitForFunction(() => {
+                  const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+                  const dlg = dialogs.find(d => /landscape\/foldable wallpaper/i.test(d.textContent || ""));
+                  if (!dlg) return false;
+                  const btn = [...dlg.querySelectorAll('button[type="submit"]')].find(b => b.textContent.trim() === "Upload");
+                  return btn && btn.disabled === false;
+                }, null, { timeout: 20000 });
+                await lsSubmit.click();
+                await lsDialog.waitFor({ state: "detached", timeout: 60000 }).catch(() => {});
+                console.log("Landscape/foldable wallpaper uploaded");
+                await page.waitForTimeout(1000);
+              } catch (e) {
+                // Never block the publish: a missing/renamed link just means no landscape variant.
+                console.warn(`Landscape/foldable upload issue (continuing): ${e.message}`);
+                await page.keyboard.press("Escape").catch(() => {});
               }
             }
 
@@ -3591,7 +3656,8 @@ jobs:
                     tags:        queueItem.tags,
                     category:    queueItem.category,
                     description: queueItem.description,
-                    coverImage:  queueItem.localThumb || null
+                    coverImage:  queueItem.localThumb || null,
+                    landscapeImage: queueItem.localLandscape || null
                   });
 
                   // Check publish status — returns {removed, statusName} instead of throwing
