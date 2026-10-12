@@ -2362,24 +2362,42 @@ jobs:
             console.log(`Uploading ${filesToUpload.length} file(s)`);
             await fileInput.setInputFiles(filesToUpload);
 
-            await page.waitForFunction((expectedCount) => {
-              const input = document.querySelector('input[data-hook="form-field-files-input"]');
-              return input && input.files && input.files.length >= expectedCount;
-            }, filesToUpload.length);
+            // v27.13: bounded wait (2 min) - a stuck file-input no longer hangs the run forever
+            try {
+              await page.waitForFunction((expectedCount) => {
+                const input = document.querySelector('input[data-hook="form-field-files-input"]');
+                return input && input.files && input.files.length >= expectedCount;
+              }, filesToUpload.length, { timeout: 2 * 60 * 1000 });
+            } catch (e) {
+              const pageText = await page.evaluate(() => document.body.innerText.slice(0, 600)).catch(() => "");
+              throw new Error(`UPLOAD_STUCK => file(s) never accepted by the file input after 2 min. Page said: ${pageText}`);
+            }
 
             console.log("Waiting for Upload button to become enabled");
             const uploadButton = dialog
               .locator('button[type="submit"]:has-text("Upload")')
               .first();
 
-            await uploadButton.waitFor({ state: "visible" });
+            await uploadButton.waitFor({ state: "visible", timeout: 2 * 60 * 1000 });
             await scrollToElement(uploadButton);
 
-            await page.waitForFunction(() => {
-              const buttons = [...document.querySelectorAll('button[type="submit"]')];
-              const upload = buttons.find(btn => btn.textContent.trim() === "Upload");
-              return upload && upload.disabled === false;
-            });
+            // v27.13: bounded wait (4 min) + tolerant label match ("Upload", "Upload (1)", "UPLOAD")
+            try {
+              await page.waitForFunction(() => {
+                const buttons = [...document.querySelectorAll('button[type="submit"]')];
+                const upload = buttons.find(btn => /^upload\b/i.test((btn.textContent || "").trim()));
+                return upload && upload.disabled === false;
+              }, null, { timeout: 4 * 60 * 1000 });
+            } catch (e) {
+              const info = await page.evaluate(() => {
+                const btns = [...document.querySelectorAll('button[type="submit"]')]
+                  .map(b => `"${(b.textContent || "").trim()}" disabled=${b.disabled}`).join(" | ");
+                const err = [...document.querySelectorAll('[class*="error"],[data-hook*="error"],[role="alert"]')]
+                  .map(n => (n.innerText || "").trim()).filter(Boolean).slice(0, 5).join(" / ");
+                return { btns, err, text: document.body.innerText.slice(0, 600) };
+              }).catch(() => ({ btns: "", err: "", text: "" }));
+              throw new Error(`UPLOAD_BUTTON_STUCK => Upload button never enabled in 4 min. Form errors: ${info.err}. Submit buttons: ${info.btns}. Page said: ${info.text}`);
+            }
 
             await uploadButton.click();
 
@@ -3854,7 +3872,7 @@ jobs:
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
-          # Telegram reports go to Tarek bhai's bot by default; repository secrets override if set
+          # Optional - create these two repository secrets to receive Telegram reports
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FOLDER_NAME: "Zedge 3"
